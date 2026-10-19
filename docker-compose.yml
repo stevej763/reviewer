@@ -1,6 +1,9 @@
-# Runs Reviewer in Docker on this Mac. The AI model runs in the native Ollama app
-# (Docker on a Mac can't use the GPU), which the container reaches at
-# http://host.docker.internal:11434.
+# Reviewer and its local AI model (Ollama), on one Docker network so the app
+# reaches the model at http://ollama:11434.
+#
+# Ollama in Docker on a Mac runs on the CPU only. For faster summaries, run the
+# native Ollama app instead and set the Ollama address in Reviewer's Settings to
+# http://host.docker.internal:11434 (then you can drop the ollama service below).
 services:
   reviewer:
     build: .
@@ -10,11 +13,29 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # Pre-fills the setup screen; the saved value in Settings wins after that.
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
     ports:
       # Only reachable from this Mac. Open http://localhost:8000
       - "127.0.0.1:${REVIEWER_PORT:-8000}:8000"
     volumes:
       - reviewer-data:/data
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: reviewer-ollama
+    restart: unless-stopped
+    ports:
+      # Also usable from the Mac itself (e.g. `curl localhost:11434`)
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 15m
 
 volumes:
   reviewer-data:
+  ollama-models:
