@@ -6,32 +6,29 @@ highlights with an AI model, and stores it encrypted. Later, pick a date range a
 performance review, brag doc, status update or blog post, exportable as Word, Markdown, a web
 page or a CSV spreadsheet.
 
-- **Everything stays on your Mac.** Speech is transcribed in the container (faster-whisper) and the audio is thrown away. Summaries and reports come from a local model in Ollama, which runs alongside the app.
+- **Everything stays on your Mac.** Speech is transcribed in the container (faster-whisper) and the audio is thrown away. Summaries and reports come from a local model in Ollama, running natively on your Mac.
 - **First-time setup in the app**: your name, role and goals (used to tailor summaries and reports), a PIN, and which AI model to use. Change any of it later in Settings.
 - **PIN login** stored as a salted scrypt hash, with an escalating lockout after wrong guesses. Entries, reports and settings are encrypted at rest.
 - **Claude is optional.** Add an Anthropic API key in Settings if you have one. (A Claude.ai or Claude Code subscription doesn't include an API key.)
 
 ## Setup on a Mac
 
+**1. Install and open Ollama** from [ollama.com/download](https://ollama.com/download). It runs
+natively so it can use the Mac's GPU (Docker on a Mac can't), and listens on port 11434.
+
+**2. Start Reviewer:**
+
 ```sh
 docker compose up -d --build
 ```
 
-This starts Reviewer and an Ollama container on the same Docker network. Open
-[http://localhost:8000](http://localhost:8000) and fill in the setup screen. In the AI model
-section the Ollama address is `http://ollama:11434`: press **Check**, pick a model and press
-**Download**. `qwen3:8b` (5.2 GB) is a good fit for a 16 GB MacBook Air.
+**3. Open [http://localhost:8000](http://localhost:8000)** and fill in the setup screen. The
+Ollama address is `http://host.docker.internal:11434`, which is how the container reaches the
+Ollama app on your Mac. Press **Check**, pick a model and press **Download**. `qwen3:8b`
+(5.2 GB) is a good fit for a 16 GB MacBook Air.
 
 The first recording also downloads the speech model (~500 MB), so it takes a minute; after that,
 a few minutes of speech transcribes in seconds.
-
-### Faster: native Ollama
-
-Docker on a Mac can't use the GPU, so Ollama in Docker runs on the CPU. The native app from
-[ollama.com/download](https://ollama.com/download) uses the GPU and is several times faster. To
-switch: stop the container (`docker compose stop ollama`), open the Ollama app, and set the
-Ollama address in Reviewer's Settings to `http://host.docker.internal:11434`. Models downloaded
-in Docker aren't shared with the native app, so download the model again from Settings.
 
 ### Choosing a model
 
