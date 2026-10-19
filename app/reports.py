@@ -46,9 +46,11 @@ def entries_digest(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def report_prompt(entries: list[dict], start: str, end: str, style: str, notes: str = "") -> tuple[str, str]:
+def report_prompt(entries: list[dict], start: str, end: str, style: str, notes: str = "",
+                  about_me: str = "") -> tuple[str, str]:
     spec = REPORT_STYLES[style]
-    prompt = (
+    prompt = f"<about_me>\n{about_me}\n</about_me>\n\n" if about_me else ""
+    prompt += (
         f"Period: {start} to {end} ({len(entries)} log entries).\n\n"
         f"Report type: {spec['label']}\n{spec['instructions']}\n"
     )

@@ -18,7 +18,8 @@ class FakeProvider(Provider):
         self.fail = fail
         self.prompts = []
 
-    def summarize(self, text, entry_date):
+    def summarize(self, text, entry_date, about_me=""):
+        self.prompts.append(about_me)
         if self.fail:
             raise ProviderError("boom")
         return normalize_summary({
@@ -34,21 +35,32 @@ class FakeProvider(Provider):
 
 
 class FakeTranscriber:
-    def transcribe(self, audio, suffix=".webm"):
-        return f"heard {len(audio)} bytes as {suffix}"
+    def transcribe(self, audio, suffix=".webm", language=None):
+        return f"heard {len(audio)} bytes as {suffix} in {language}"
+
+
+SETUP = {
+    "profile": {"name": "Steve", "role": "Engineer", "company": "Acme", "goals": "Get promoted"},
+    "pin": PIN,
+    "ai": {"provider": "ollama", "ollama_url": "http://host.docker.internal:11434", "ollama_model": "qwen3:8b",
+           "anthropic_api_key": "sk-ant-secret-1234", "anthropic_model": "claude-opus-5-5"},
+    "speech": {"language": "en"},
+}
 
 
 @pytest.fixture
 def make_client(tmp_path, monkeypatch):
-    def _make(providers=None):
+    def _make(providers=None, setup=True):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
-        monkeypatch.setenv("APP_PIN", PIN)
         monkeypatch.setenv("SECRET_KEY", "test-secret")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
         settings = load_settings()
         app = create_app(settings, providers=providers if providers is not None else {"claude": FakeProvider()},
                          transcriber=FakeTranscriber())
-        return TestClient(app), settings
+        c = TestClient(app)
+        if setup:
+            assert c.post("/api/setup", json=SETUP).status_code == 200
+            c.cookies.clear()
+        return c, settings
     return _make
 
 
@@ -57,6 +69,66 @@ def client(make_client):
     c, _ = make_client()
     assert c.post("/api/login", json={"pin": PIN}).status_code == 200
     return c
+
+
+def test_first_run_setup(make_client):
+    c, _ = make_client(setup=False)
+    s = c.get("/api/session").json()
+    assert s["setup_required"] and s["defaults"]["ai"]["ollama_model"] == "qwen3:8b"
+    assert c.post("/api/login", json={"pin": PIN}).status_code == 409
+    assert c.get("/api/entries").status_code == 409
+    bad = {**SETUP, "pin": "12ab"}
+    assert c.post("/api/setup", json=bad).status_code == 422
+    assert c.post("/api/setup", json=SETUP).status_code == 200
+    assert c.get("/api/entries").status_code == 200  # setup logs you in
+    assert c.get("/api/session").json()["name"] == "Steve"
+    assert c.post("/api/setup", json=SETUP).status_code == 409  # can't redo setup
+
+    # PIN is stored hashed and the API key encrypted, never in plain text
+    db = sqlite3.connect(c.app.state.store.path)
+    blob = b"".join(bytes(r[0]) for r in db.execute("SELECT value FROM settings"))
+    assert PIN.encode() not in blob and b"sk-ant" not in blob
+    assert PIN not in c.app.state.config.get()["pin_hash"]
+
+
+def test_settings_hide_secrets_and_update(client):
+    cfg = client.get("/api/settings").json()
+    assert "pin_hash" not in cfg and "anthropic_api_key" not in cfg["ai"]
+    assert cfg["ai"]["anthropic_key_set"] and cfg["ai"]["anthropic_key_hint"] == "…1234"
+    new_ai = {**SETUP["ai"], "anthropic_api_key": None, "ollama_model": "gemma3:4b"}
+    cfg = client.put("/api/settings", json={"ai": new_ai, "profile": {"name": "S"}}).json()
+    assert cfg["ai"]["ollama_model"] == "gemma3:4b" and cfg["ai"]["anthropic_key_set"]  # key kept
+    assert cfg["profile"]["name"] == "S" and cfg["profile"]["role"] == ""
+
+
+def test_change_pin_signs_out_other_devices(make_client):
+    c1, _ = make_client()
+    c1.post("/api/login", json={"pin": PIN})
+    c2 = TestClient(c1.app)
+    c2.post("/api/login", json={"pin": PIN})
+    assert c1.post("/api/settings/pin", json={"current": "000000", "new": "112233"}).status_code == 400
+    assert c1.post("/api/settings/pin", json={"current": PIN, "new": "112233"}).status_code == 200
+    assert c1.get("/api/entries").status_code == 200
+    assert c2.get("/api/entries").status_code == 401
+    assert c2.post("/api/login", json={"pin": PIN}).status_code == 401
+    assert c2.post("/api/login", json={"pin": "112233"}).status_code == 200
+
+
+def test_profile_reaches_prompts(make_client):
+    fake = FakeProvider()
+    c, _ = make_client({"claude": fake})
+    c.post("/api/login", json={"pin": PIN})
+    c.post("/api/entries", json={"date": "2026-10-01", "text": "x"})
+    assert "Role: Engineer" in fake.prompts[0] and "Get promoted" in fake.prompts[0]
+
+
+def test_build_providers_from_settings():
+    from app.llm import build_providers
+    s = load_settings()
+    assert set(build_providers({"ollama_url": "http://x", "ollama_model": "m"}, s)) == {"ollama"}
+    both = build_providers({"ollama_url": "http://x", "ollama_model": "m", "anthropic_api_key": "k",
+                            "anthropic_model": "claude-opus-5-5"}, s)
+    assert set(both) == {"ollama", "claude"}
 
 
 def test_requires_login(make_client):
@@ -71,7 +143,8 @@ def test_requires_login(make_client):
 
 def test_lockout_escalates_and_blocks_correct_pin():
     now = [0.0]
-    auth = PinAuth("1234", "s", 30, max_attempts=3, lockout_minutes=1, clock=lambda: now[0])
+    auth = PinAuth(lambda p: p == "1234", lambda: "epoch", "s", 30, max_attempts=3, lockout_minutes=1,
+                   clock=lambda: now[0])
     for _ in range(2):
         with pytest.raises(Exception) as exc:
             auth.check_pin("0000")
@@ -165,13 +238,13 @@ def test_report_prompt_contains_entries(make_client):
     c.post("/api/login", json={"pin": PIN})
     c.post("/api/entries", json={"date": "2026-10-01", "text": "Shipped Apollo"})
     c.post("/api/reports", json={"start": "2026-10-01", "end": "2026-10-31", "notes": "focus on leadership"})
-    prompt = fake.prompts[0]
+    prompt = fake.prompts[-1]
     assert "2026-10-01" in prompt and "Unblocked the team" in prompt and "focus on leadership" in prompt
 
 
 def test_transcribe(client):
     r = client.post("/api/transcribe", files={"audio": ("r.mp4", b"abc", "audio/mp4")})
-    assert r.json() == {"text": "heard 3 bytes as .mp4"}
+    assert r.json() == {"text": "heard 3 bytes as .mp4 in en"}
 
 
 def test_security_headers_and_static(client):
@@ -186,3 +259,10 @@ def test_normalize_summary_handles_sloppy_output():
                            "tags": "Solo"})
     assert [h["category"] for h in s["highlights"]] == ["other", "other"]
     assert s["tags"] == ["solo"] and s["wins"] == []
+
+
+def test_ollama_context_size():
+    from app.llm import _context_size
+    assert _context_size("a" * 100, output_tokens=2048) == 8192
+    assert _context_size("a" * 60000, output_tokens=4096) == 32768
+    assert _context_size("a" * 10_000_000, output_tokens=4096) == 65536

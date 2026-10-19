@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(entry_date);
 
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -56,6 +61,20 @@ class Store:
             conn.commit()
         finally:
             conn.close()
+
+    # ---- settings ------------------------------------------------------
+
+    def get_setting(self, key: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(self.box.open(row["value"])) if row else None
+
+    def set_setting(self, key: str, value: dict) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, self.box.seal(json.dumps(value))),
+            )
 
     # ---- entries -------------------------------------------------------
 

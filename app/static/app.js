@@ -31,6 +31,10 @@ async function api(path, { method = "GET", body, form } = {}) {
   const res = await fetch(path, opts);
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
+  if (res.status === 409 && path !== "/api/setup") {
+    boot();
+    throw new Error((data && data.detail) || "Setup needed");
+  }
   if (res.status === 401 && path !== "/api/login") {
     showLogin();
     throw new Error("Please unlock again.");
@@ -89,20 +93,26 @@ function showLogin() {
   setTimeout(() => $("#pin").focus(), 50);
 }
 
-async function boot() {
+async function refreshSession() {
   const s = await api("/api/session");
-  state.providers = s.providers;
+  state.providers = s.providers || [];
   state.defaultProvider = s.default_provider;
   state.styles = s.report_styles;
-  if (!s.authenticated) return showLogin();
-  $("#login").hidden = true;
-  $("#app").hidden = false;
   fillProviders($("#entry-provider"));
   fillProviders($("#rep-provider"));
+  $("#log-error").textContent = s.authenticated && !state.providers.length
+    ? "No AI model is set up yet, so entries will be saved without a summary. Add one in Settings." : "";
+  return s;
+}
+
+async function boot() {
+  const s = await refreshSession();
+  if (s.setup_required) return showSetup(s.defaults);
+  if (!s.authenticated) return showLogin();
+  $("#login").hidden = true;
+  $("#setup").hidden = true;
+  $("#app").hidden = false;
   $("#rep-style").replaceChildren(...Object.entries(state.styles).map(([k, v]) => el("option", { value: k }, v)));
-  if (!state.providers.length) {
-    $("#log-error").textContent = "No AI model is configured yet. Entries will be saved without a summary.";
-  }
   showView(location.hash.slice(1) || "log");
 }
 
@@ -125,7 +135,7 @@ $("#logout").addEventListener("click", async () => {
 
 // ---------- navigation ----------
 
-const TITLES = { log: "Today", history: "History", reports: "Reports" };
+const TITLES = { log: "Today", history: "History", reports: "Reports", settings: "Settings" };
 
 function showView(name) {
   if (!TITLES[name]) name = "log";
@@ -135,7 +145,10 @@ function showView(name) {
   history.replaceState(null, "", `#${name}`);
   if (name === "history") loadHistory();
   if (name === "reports") loadReports();
+  if (name === "settings") loadSettings();
+  $("#open-settings").classList.toggle("active", name === "settings");
 }
+$("#open-settings").addEventListener("click", () => showView("settings"));
 document.querySelectorAll(".tabbar button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
 
 // ---------- recording ----------
@@ -426,6 +439,242 @@ $("#make-report").addEventListener("click", async (e) => {
       await openReport(report.id);
       loadReports();
     } catch (err) { $("#rep-error").textContent = err.message; }
+  });
+});
+
+// ---------- setup & settings ----------
+
+const RECOMMENDED_MODELS = [
+  { name: "qwen3:8b", size: "5.2 GB", note: "Recommended for a 16 GB Mac: good summaries, quick" },
+  { name: "gemma3:12b", size: "8.1 GB", note: "Better writing, slower, uses more memory" },
+  { name: "gemma3:4b", size: "3.3 GB", note: "Fastest and lightest, simpler summaries" },
+  { name: "llama3.1:8b", size: "4.9 GB", note: "Solid all-rounder" },
+];
+
+const LANGUAGES = [["en", "English"], ["", "Detect automatically"], ["es", "Spanish"], ["fr", "French"],
+  ["de", "German"], ["it", "Italian"], ["pt", "Portuguese"], ["nl", "Dutch"]];
+
+function field(label, input, hint) {
+  return el("label", {}, label, input, hint ? el("span", { class: "muted small" }, hint) : null);
+}
+
+function input(attrs, value) {
+  const node = el(attrs.rows ? "textarea" : "input", attrs);
+  node.value = value || "";
+  return node;
+}
+
+function formatBytes(n) {
+  return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
+}
+
+// Builds the profile / AI / speech form used by both first-time setup and Settings.
+function settingsForm(cfg, { setup = false, onSaved } = {}) {
+  const p = cfg.profile;
+  const ai = cfg.ai;
+  const f = {
+    name: input({ autocomplete: "name", placeholder: "e.g. Steve" }, p.name),
+    role: input({ placeholder: "e.g. Senior Software Engineer" }, p.role),
+    company: input({ placeholder: "e.g. Platform team at Acme" }, p.company),
+    goals: input({ rows: 3, placeholder: "e.g. Working towards Staff Engineer; my review focuses on technical leadership and cross-team impact" }, p.goals),
+    pin: input({ type: "password", inputmode: "numeric", autocomplete: "new-password", placeholder: "4 to 12 digits" }),
+    pin2: input({ type: "password", inputmode: "numeric", autocomplete: "new-password" }),
+    ollamaUrl: input({ placeholder: "http://host.docker.internal:11434" }, ai.ollama_url),
+    ollamaModel: input({ list: "model-suggestions", autocapitalize: "off", spellcheck: "false" }, ai.ollama_model),
+    claudeKey: input({ type: "password", autocomplete: "off",
+      placeholder: ai.anthropic_key_set ? `Saved (${ai.anthropic_key_hint || "hidden"}). Leave blank to keep` : "sk-ant-… (optional)" }),
+    claudeModel: input({}, ai.anthropic_model),
+    language: el("select", {}, LANGUAGES.map(([v, l]) => el("option", { value: v, selected: v === cfg.speech.language }, l))),
+  };
+
+  const providerRadio = (value, title, sub) => el("label", { class: "radio-card" },
+    el("input", { type: "radio", name: setup ? "provider-setup" : "provider", value, checked: ai.provider === value }),
+    el("b", {}, title), el("span", {}, sub));
+  const providers = el("div", { class: "radio-row" },
+    providerRadio("ollama", "Local (Ollama)", "Private and free. Runs on your Mac"),
+    providerRadio("claude", "Claude", "Best quality. Needs an API key"));
+
+  // Ollama connection check, installed models and downloads
+  const status = el("p", { class: "status-line" });
+  const progress = el("div", { class: "progress", hidden: true }, el("div"));
+  const downloadBtn = el("button", { type: "button", class: "btn small", hidden: true }, "Download model");
+  const suggestions = el("datalist", { id: "model-suggestions" });
+  const picks = el("div", { class: "model-list" });
+  let installed = [];
+
+  function renderPicks() {
+    picks.replaceChildren(...RECOMMENDED_MODELS.map((m) => {
+      const have = installed.some((i) => i.name === m.name || i.name === `${m.name}:latest`);
+      return el("button", {
+        type: "button", class: "chip model-option" + (f.ollamaModel.value === m.name ? " active" : ""),
+        onclick: () => { f.ollamaModel.value = m.name; renderPicks(); updateDownload(); },
+      }, `${m.name} · ${m.size}${have ? " · installed" : ""} — ${m.note}`);
+    }));
+    suggestions.replaceChildren(...[...new Set([...installed.map((i) => i.name), ...RECOMMENDED_MODELS.map((m) => m.name)])]
+      .map((n) => el("option", { value: n })));
+  }
+
+  function updateDownload() {
+    const name = f.ollamaModel.value.trim();
+    const have = installed.some((i) => i.name === name || i.name === `${name}:latest`);
+    downloadBtn.hidden = !name || have || !status.classList.contains("ok");
+    downloadBtn.textContent = `Download ${name}`;
+  }
+
+  async function checkOllama() {
+    status.className = "status-line";
+    status.textContent = "Checking…";
+    try {
+      const res = await api("/api/ollama/models", { method: "POST", body: { url: f.ollamaUrl.value.trim() } });
+      installed = res.models;
+      status.className = "status-line ok";
+      status.textContent = installed.length
+        ? `Connected. Installed: ${installed.map((m) => `${m.name} (${formatBytes(m.size)})`).join(", ")}`
+        : "Connected. No models downloaded yet; pick one below.";
+    } catch (err) {
+      installed = [];
+      status.className = "status-line bad";
+      status.textContent = err.message;
+    }
+    renderPicks();
+    updateDownload();
+  }
+
+  async function pollDownload() {
+    const st = await api("/api/ollama/pull");
+    const bar = progress.firstChild;
+    if (st.status === "downloading") {
+      progress.hidden = false;
+      bar.style.width = st.total ? `${Math.round((st.completed / st.total) * 100)}%` : "2%";
+      status.className = "status-line";
+      status.textContent = st.total
+        ? `Downloading ${st.model}: ${formatBytes(st.completed)} of ${formatBytes(st.total)}`
+        : `Downloading ${st.model}: ${st.detail || "starting"}…`;
+      setTimeout(pollDownload, 1000);
+    } else if (st.status === "done") {
+      progress.hidden = true;
+      toast(`${st.model} is ready`);
+      checkOllama();
+    } else if (st.status === "error") {
+      progress.hidden = true;
+      status.className = "status-line bad";
+      status.textContent = `Download failed: ${st.error}`;
+    }
+  }
+
+  downloadBtn.addEventListener("click", async () => {
+    downloadBtn.hidden = true;
+    try {
+      await api("/api/ollama/pull", { method: "POST", body: { url: f.ollamaUrl.value.trim(), model: f.ollamaModel.value.trim() } });
+      pollDownload();
+    } catch (err) { status.className = "status-line bad"; status.textContent = err.message; }
+  });
+  f.ollamaModel.addEventListener("input", () => { renderPicks(); updateDownload(); });
+
+  const ollamaBox = el("div", { class: "settings-form" },
+    field("Ollama address", el("div", { class: "inline" }, f.ollamaUrl,
+      el("button", { type: "button", class: "btn small", onclick: checkOllama }, "Check")),
+    "Ollama running on this Mac is reachable from Docker at http://host.docker.internal:11434"),
+    status, progress,
+    field("Model", f.ollamaModel), suggestions, picks, downloadBtn);
+  const claudeBox = el("div", { class: "settings-form" },
+    field("Anthropic API key", f.claudeKey, "From console.anthropic.com. Separate from a Claude subscription."),
+    field("Claude model", f.claudeModel));
+
+  const error = el("p", { class: "error", role: "alert" });
+  const save = el("button", { type: "submit", class: "btn primary" }, setup ? "Finish setup" : "Save settings");
+
+  const form = el("form", { class: "settings-form", autocomplete: "off" },
+    el("section", { class: "card" },
+      el("h2", {}, "About you"),
+      el("p", { class: "muted small" }, "Used to tailor your summaries and reports."),
+      field("Your name", f.name),
+      field("Role", f.role),
+      field("Team / company", f.company),
+      field("Goals and what matters in your role", f.goals, "Optional. Reports will emphasise these.")),
+    setup ? el("section", { class: "card" },
+      el("h2", {}, "Choose a PIN"),
+      el("p", { class: "muted small" }, "You'll type this to unlock the app. Use 6+ digits."),
+      el("div", { class: "grid2" }, field("PIN", f.pin), field("Confirm PIN", f.pin2))) : null,
+    el("section", { class: "card" },
+      el("h2", {}, "AI model"),
+      el("p", { class: "muted small" }, "Turns what you say into highlights and writes your reports."),
+      providers,
+      el("h3", { class: "subhead" }, "Local model (Ollama)"), ollamaBox,
+      el("h3", { class: "subhead" }, "Claude (optional)"), claudeBox),
+    el("section", { class: "card" },
+      el("h2", {}, "Speech"),
+      el("p", { class: "muted small" }, "Recordings are transcribed on this machine and never stored."),
+      field("Language you speak in", f.language)),
+    el("div", { class: "actions" }, save),
+    error);
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    const provider = form.querySelector("input[type=radio]:checked")?.value || "ollama";
+    const body = {
+      profile: { name: f.name.value.trim(), role: f.role.value.trim(), company: f.company.value.trim(), goals: f.goals.value.trim() },
+      ai: {
+        provider,
+        ollama_url: f.ollamaUrl.value.trim(),
+        ollama_model: f.ollamaModel.value.trim(),
+        anthropic_api_key: f.claudeKey.value.trim() || null,
+        anthropic_model: f.claudeModel.value.trim(),
+      },
+      speech: { language: f.language.value },
+    };
+    if (provider === "claude" && !body.ai.anthropic_api_key && !ai.anthropic_key_set) {
+      error.textContent = "Add an Anthropic API key to use Claude, or pick the local model.";
+      return;
+    }
+    if (setup) {
+      if (f.pin.value !== f.pin2.value) { error.textContent = "The PINs don't match."; return; }
+      body.pin = f.pin.value;
+    }
+    await busy(save, "Saving…", async () => {
+      try {
+        const saved = await api(setup ? "/api/setup" : "/api/settings", { method: setup ? "POST" : "PUT", body });
+        onSaved && onSaved(saved);
+      } catch (err) { error.textContent = err.message; }
+    });
+  });
+
+  renderPicks();
+  if (ai.ollama_url) checkOllama();
+  // Resume showing progress if a download is already running.
+  api("/api/ollama/pull").then((st) => { if (st.status === "downloading") pollDownload(); }).catch(() => {});
+  return form;
+}
+
+function showSetup(defaults) {
+  $("#login").hidden = true;
+  $("#app").hidden = true;
+  $("#setup").hidden = false;
+  $("#setup-form").replaceChildren(settingsForm(defaults, {
+    setup: true,
+    onSaved: async () => { $("#setup").hidden = true; toast("All set"); await boot(); },
+  }));
+}
+
+async function loadSettings() {
+  try {
+    const cfg = await api("/api/settings");
+    $("#settings-form").replaceChildren(settingsForm(cfg, {
+      onSaved: async () => { toast("Settings saved"); await refreshSession(); },
+    }));
+  } catch (err) { toast(err.message); }
+}
+
+$("#change-pin").addEventListener("click", async (e) => {
+  $("#pin-error").textContent = "";
+  await busy(e.currentTarget, "Changing…", async () => {
+    try {
+      await api("/api/settings/pin", { method: "POST", body: { current: $("#pin-current").value, new: $("#pin-new").value } });
+      $("#pin-current").value = "";
+      $("#pin-new").value = "";
+      toast("PIN changed");
+    } catch (err) { $("#pin-error").textContent = err.message; }
   });
 });
 

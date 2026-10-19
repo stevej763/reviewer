@@ -11,11 +11,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import reports
+from .appconfig import PROVIDERS, AppConfig, hash_pin
 from .auth import COOKIE_NAME, PinAuth
 from .config import Settings, load_settings
 from .crypto import Box
 from .db import Store
-from .llm import Provider, ProviderError, build_providers, normalize_summary
+from .llm import (ModelDownloads, OllamaClient, Provider, ProviderError, about_me, build_providers,
+                  normalize_summary)
 from .prompts import REPORT_STYLES
 from .transcribe import Transcriber
 
@@ -35,6 +37,80 @@ def _check_date(value: str) -> str:
 
 class LoginIn(BaseModel):
     pin: str = Field(min_length=1, max_length=64)
+
+
+def _check_pin(value: str) -> str:
+    value = value.strip()
+    if not value.isdigit() or not 4 <= len(value) <= 12:
+        raise ValueError("PIN must be 4 to 12 digits")
+    return value
+
+
+class ProfileIn(BaseModel):
+    name: str = Field(default="", max_length=100)
+    role: str = Field(default="", max_length=200)
+    company: str = Field(default="", max_length=200)
+    goals: str = Field(default="", max_length=2000)
+
+
+class AiIn(BaseModel):
+    provider: str = "ollama"
+    ollama_url: str = Field(default="", max_length=300)
+    ollama_model: str = Field(default="", max_length=200)
+    anthropic_api_key: str | None = Field(default=None, max_length=300)  # None = keep current
+    anthropic_model: str = Field(default="", max_length=100)
+
+    @field_validator("provider")
+    @classmethod
+    def _provider(cls, v):
+        if v not in PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(PROVIDERS)}")
+        return v
+
+    @field_validator("ollama_url")
+    @classmethod
+    def _url(cls, v):
+        v = v.strip().rstrip("/")
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("Ollama address must start with http:// or https://")
+        return v
+
+
+class SpeechIn(BaseModel):
+    language: str = Field(default="en", max_length=10)
+
+
+class SetupIn(BaseModel):
+    profile: ProfileIn
+    pin: str
+    ai: AiIn
+    speech: SpeechIn = SpeechIn()
+
+    @field_validator("pin")
+    @classmethod
+    def _pin(cls, v):
+        return _check_pin(v)
+
+
+class SettingsIn(BaseModel):
+    profile: ProfileIn | None = None
+    ai: AiIn | None = None
+    speech: SpeechIn | None = None
+
+
+class PinChangeIn(BaseModel):
+    current: str = Field(max_length=64)
+    new: str
+
+    @field_validator("new")
+    @classmethod
+    def _pin(cls, v):
+        return _check_pin(v)
+
+
+class OllamaIn(BaseModel):
+    url: str = Field(max_length=300)
+    model: str | None = Field(default=None, max_length=200)
 
 
 class EntryIn(BaseModel):
@@ -85,13 +161,31 @@ class ReportIn(BaseModel):
 
 def create_app(settings: Settings | None = None, providers: dict[str, Provider] | None = None,
                transcriber: Transcriber | None = None) -> FastAPI:
+    """`providers` overrides the configured AI providers (used by tests)."""
     settings = settings or load_settings()
     box = Box(settings.secret_key)
     store = Store(settings.db_path, box)
-    auth = PinAuth(settings.pin, settings.secret_key, settings.session_days,
-                   settings.max_pin_attempts, settings.lockout_minutes)
-    providers = providers if providers is not None else build_providers(settings)
+    config = AppConfig(store, settings)
+    auth = PinAuth(config.check_pin, lambda: (config.get().get("pin_hash") or "")[-16:], settings.secret_key,
+                   settings.session_days, settings.max_pin_attempts, settings.lockout_minutes)
     transcriber = transcriber or Transcriber(settings)
+    downloads = ModelDownloads()
+    provider_cache: dict = {"version": None, "providers": {}}
+
+    def current_providers() -> dict[str, Provider]:
+        if providers is not None:
+            return providers
+        if provider_cache["version"] != config.version:
+            provider_cache["providers"] = build_providers(config.get()["ai"], settings)
+            provider_cache["version"] = config.version
+        return provider_cache["providers"]
+
+    def default_provider() -> str | None:
+        available = current_providers()
+        preferred = config.get()["ai"]["provider"]
+        if preferred in available:
+            return preferred
+        return next(iter(available), None)
 
     app = FastAPI(title="Reviewer", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -117,34 +211,115 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
     def require_login(request: Request):
+        if not config.is_setup:
+            raise HTTPException(409, "Finish setting up the app first.")
         if not auth.is_valid(request.cookies.get(COOKIE_NAME)):
             raise HTTPException(401, "Not logged in")
 
     def pick_provider(name: str | None) -> Provider:
-        if not providers:
-            raise HTTPException(503, "No AI provider configured. Set ANTHROPIC_API_KEY and/or OLLAMA_URL.")
-        name = (name or settings.default_provider).lower()
-        if name not in providers:
-            raise HTTPException(400, f"Provider '{name}' isn't configured.")
-        return providers[name]
+        available = current_providers()
+        if not available:
+            raise HTTPException(503, "No AI model is set up yet. Add one in Settings.")
+        name = (name or default_provider() or "").lower()
+        if name not in available:
+            raise HTTPException(400, f"The '{name}' model isn't set up. Check Settings.")
+        return available[name]
+
+    def me() -> str:
+        return about_me(config.get()["profile"])
+
+    def set_session_cookie(response: Response, token: str):
+        response.set_cookie(COOKIE_NAME, token, max_age=auth.max_age, httponly=True,
+                            secure=settings.cookie_secure, samesite="strict", path="/")
 
     # ---- auth ------------------------------------------------------------
 
     @app.get("/api/session")
     def session(request: Request):
-        return {
-            "authenticated": auth.is_valid(request.cookies.get(COOKIE_NAME)),
+        setup_done = config.is_setup
+        authenticated = setup_done and auth.is_valid(request.cookies.get(COOKIE_NAME))
+        info = {
+            "setup_required": not setup_done,
+            "authenticated": authenticated,
             "locked_for": auth.locked_for(),
-            "providers": [{"name": p.name, "model": p.model} for p in providers.values()],
-            "default_provider": settings.default_provider if settings.default_provider in providers else None,
             "report_styles": {k: v["label"] for k, v in REPORT_STYLES.items()},
         }
+        if not setup_done:
+            info["defaults"] = config.public()  # pre-fills the setup screen
+        if authenticated:
+            info["providers"] = [{"name": p.name, "model": p.model} for p in current_providers().values()]
+            info["default_provider"] = default_provider()
+            info["name"] = config.get()["profile"]["name"]
+        return info
+
+    # ---- first-time setup and settings ------------------------------------
+
+    @app.post("/api/setup")
+    def setup(body: SetupIn, response: Response):
+        if config.is_setup:
+            raise HTTPException(409, "Already set up. Log in instead.")
+        ai = body.ai.model_dump()
+        if ai["anthropic_api_key"] is None:
+            ai.pop("anthropic_api_key")
+        config.update({"profile": body.profile.model_dump(), "ai": ai, "speech": body.speech.model_dump(),
+                       "pin_hash": hash_pin(body.pin)})
+        set_session_cookie(response, auth.issue_token())
+        return {"ok": True}
+
+    @app.get("/api/settings", dependencies=[Depends(require_login)])
+    def get_settings():
+        return config.public()
+
+    @app.put("/api/settings", dependencies=[Depends(require_login)])
+    def put_settings(body: SettingsIn):
+        changes = {}
+        if body.profile:
+            changes["profile"] = body.profile.model_dump()
+        if body.ai:
+            ai = body.ai.model_dump()
+            if ai["anthropic_api_key"] is None:
+                ai.pop("anthropic_api_key")  # leave the saved key alone
+            changes["ai"] = ai
+        if body.speech:
+            changes["speech"] = body.speech.model_dump()
+        config.update(changes)
+        return config.public()
+
+    @app.post("/api/settings/pin", dependencies=[Depends(require_login)])
+    def change_pin(body: PinChangeIn, response: Response):
+        if not config.check_pin(body.current.strip()):
+            raise HTTPException(400, "Current PIN is wrong.")
+        config.update({"pin_hash": hash_pin(body.new)})
+        # Other devices are signed out; keep this one signed in.
+        set_session_cookie(response, auth.issue_token())
+        return {"ok": True}
+
+    def require_setup_or_login(request: Request):
+        # Ollama helpers are used by the setup screen (before there's a PIN) and by Settings.
+        if config.is_setup:
+            require_login(request)
+
+    @app.post("/api/ollama/models", dependencies=[Depends(require_setup_or_login)])
+    def ollama_models(body: OllamaIn):
+        return {"models": OllamaClient(body.url).models()}
+
+    @app.post("/api/ollama/pull", dependencies=[Depends(require_setup_or_login)])
+    def ollama_pull(body: OllamaIn):
+        if not body.model:
+            raise HTTPException(400, "Choose a model to download.")
+        return downloads.start(body.url, body.model)
+
+    @app.get("/api/ollama/pull", dependencies=[Depends(require_setup_or_login)])
+    def ollama_pull_status():
+        return downloads.state
+
+    # ---- auth ------------------------------------------------------------
 
     @app.post("/api/login")
     def login(body: LoginIn, response: Response):
-        token = auth.check_pin(body.pin.strip())
-        response.set_cookie(COOKIE_NAME, token, max_age=auth.max_age, httponly=True,
-                            secure=settings.cookie_secure, samesite="strict", path="/")
+        if not config.is_setup:
+            raise HTTPException(409, "Finish setting up the app first.")
+        set_session_cookie(response, auth.check_pin(body.pin.strip()))
         return {"ok": True}
 
     @app.post("/api/logout")
@@ -168,7 +343,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         if "wav" in content_type:
             suffix = ".wav"
         try:
-            text = transcriber.transcribe(data, suffix=suffix)
+            text = transcriber.transcribe(data, suffix=suffix, language=config.get()["speech"]["language"])
         except Exception as exc:  # decoding / model errors
             log.exception("transcription failed")
             raise HTTPException(500, f"Transcription failed: {exc}") from exc
@@ -178,7 +353,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     def _summarize(entry_id: int, text: str, entry_date: str, provider_name: str | None) -> dict:
         provider = pick_provider(provider_name)
-        summary = provider.summarize(text, entry_date)
+        summary = provider.summarize(text, entry_date, me())
         return store.update_entry(entry_id, summary=summary, provider=provider.name, model=provider.model)
 
     @app.get("/api/entries", dependencies=[Depends(require_login)])
@@ -235,7 +410,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         if not entries:
             raise HTTPException(400, "No log entries in that date range.")
         provider = pick_provider(body.provider)
-        system, prompt = reports.report_prompt(entries, body.start, body.end, body.style, body.notes)
+        system, prompt = reports.report_prompt(entries, body.start, body.end, body.style, body.notes, me())
         content = provider.write(system, prompt)
         fallback_title = f"{REPORT_STYLES[body.style]['label']}: {body.start} to {body.end}"
         title = reports.title_from_markdown(content, fallback_title)
@@ -298,6 +473,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     app.state.store = store
+    app.state.config = config
     app.state.transcriber = transcriber
     return app
 

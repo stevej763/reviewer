@@ -28,7 +28,7 @@ class Transcriber:
     def warm_up(self):
         self._load()
 
-    def transcribe(self, audio: bytes, suffix: str = ".webm") -> str:
+    def transcribe(self, audio: bytes, suffix: str = ".webm", language: str | None = None) -> str:
         model = self._load()
         # PyAV (bundled with faster-whisper) decodes webm/opus from Chrome and mp4/aac from Safari.
         with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
@@ -36,7 +36,7 @@ class Transcriber:
             tmp.flush()
             segments, _info = model.transcribe(
                 tmp.name,
-                language=self._settings.whisper_language or None,
+                language=(language if language is not None else self._settings.whisper_language) or None,
                 vad_filter=True,
                 beam_size=5,
             )

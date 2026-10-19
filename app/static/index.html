@@ -31,11 +31,24 @@
     </div>
   </main>
 
+  <!-- First-time setup -->
+  <main id="setup" class="setup" hidden>
+    <div class="setup-intro">
+      <img class="brand-mark" src="/static/icon.svg" alt="">
+      <h1>Welcome to Reviewer</h1>
+      <p class="muted">A few details to get started. You can change any of this later in Settings.</p>
+    </div>
+    <div id="setup-form"></div>
+  </main>
+
   <!-- App -->
   <div id="app" hidden>
     <header class="topbar">
       <h1 class="title" id="view-title">Today</h1>
-      <button class="icon-btn" id="logout" aria-label="Lock">Lock</button>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="open-settings">Settings</button>
+        <button class="icon-btn" id="logout" aria-label="Lock">Lock</button>
+      </div>
     </header>
 
     <!-- Log view -->
@@ -114,6 +127,29 @@
 
       <h2 class="section-title">Past reports</h2>
       <div id="report-list"></div>
+    </section>
+
+    <!-- Settings view -->
+    <section id="view-settings" class="view" hidden>
+      <div id="settings-form"></div>
+      <div class="card">
+        <h2>Change PIN</h2>
+        <div class="grid2">
+          <label>Current PIN <input id="pin-current" type="password" inputmode="numeric" autocomplete="current-password"></label>
+          <label>New PIN <input id="pin-new" type="password" inputmode="numeric" autocomplete="new-password"></label>
+        </div>
+        <div class="actions"><button id="change-pin" class="btn">Change PIN</button></div>
+        <p class="muted small">Changing your PIN signs out your other devices.</p>
+        <p id="pin-error" class="error" role="alert"></p>
+      </div>
+      <div class="card">
+        <h2>Your data</h2>
+        <p class="muted small">Everything is stored encrypted on this machine. Download a full copy any time.</p>
+        <div class="exports">
+          <a class="btn small" href="/api/export/backup.json">Download backup (JSON)</a>
+          <a class="btn small" href="/api/export/highlights.csv">All highlights (CSV)</a>
+        </div>
+      </div>
     </section>
 
     <nav class="tabbar">
