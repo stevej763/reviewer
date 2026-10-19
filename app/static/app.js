@@ -224,7 +224,7 @@ async function sendRecording() {
   try {
     const entry = await api("/api/recordings", { method: "POST", form });
     rec.pending = null;
-    $("#latest").prepend(renderSummary(entry, { onChange: loadLatest }));
+    addToLatest(renderSummary(entry, { onChange: loadLatest }));
     setRecordUI("idle", "Saved ✓ Tap to record more");
     toast("Recording saved. Processing in the background");
   } catch (err) {
@@ -435,7 +435,7 @@ $("#save-entry").addEventListener("click", async (e) => {
       });
       $("#entry-text").value = "";
       try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
-      $("#latest").prepend(renderSummary(entry, { onChange: loadLatest }));
+      addToLatest(renderSummary(entry, { onChange: loadLatest }));
       toast("Saved. Writing highlights in the background");
     } catch (err) {
       $("#log-error").textContent = err.message;
@@ -455,6 +455,13 @@ async function loadLatest() {
     const [entries, days] = await Promise.all([api(`/api/entries?start=${day}&end=${day}`), fetchDays(day, day)]);
     $("#latest").replaceChildren(...days.map(renderDay), ...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
   } catch { /* shown elsewhere */ }
+}
+
+// New entries go just below the end-of-day card, which always stays pinned at the top.
+function addToLatest(card) {
+  const day = $("#latest .day-summary");
+  if (day) day.after(card);
+  else $("#latest").prepend(card);
 }
 
 // Shows, updates or removes the selected day's end-of-day card on the Log view.
