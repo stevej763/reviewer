@@ -40,7 +40,7 @@ class AppConfig:
     def defaults(self) -> dict:
         s = self._settings
         return {
-            "profile": {"name": "", "role": "", "company": "", "goals": ""},
+            "profile": {"name": "", "role": "", "company": "", "goals": "", "context": ""},
             "pin_hash": None,
             "ai": {
                 "provider": s.default_provider if s.default_provider in PROVIDERS else "ollama",

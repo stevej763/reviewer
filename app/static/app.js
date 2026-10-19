@@ -544,6 +544,7 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
     name: input({ autocomplete: "name", placeholder: "e.g. Steve" }, p.name),
     role: input({ placeholder: "e.g. Senior Software Engineer" }, p.role),
     company: input({ placeholder: "e.g. Platform team at Acme" }, p.company),
+    context: input({ rows: 6, placeholder: "e.g.\nProjects: Apollo (payments rewrite), Atlas (internal admin tool)\nPeople: Sam (junior dev I mentor), Priya (product manager)\nAcronyms: PSP = payment service provider\nImpact that matters here: reliability, unblocking other teams" }, p.context),
     goals: input({ rows: 3, placeholder: "e.g. Working towards Staff Engineer; my review focuses on technical leadership and cross-team impact" }, p.goals),
     pin: input({ type: "password", inputmode: "numeric", autocomplete: "new-password", placeholder: "4 to 12 digits" }),
     pin2: input({ type: "password", inputmode: "numeric", autocomplete: "new-password" }),
@@ -659,7 +660,9 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
       field("Your name", f.name),
       field("Role", f.role),
       field("Team / company", f.company),
-      field("Goals and what matters in your role", f.goals, "Optional. Reports will emphasise these.")),
+      field("Goals and what matters in your role", f.goals, "Optional. Reports will emphasise these."),
+      field("Background for the AI", f.context,
+        "Optional. Projects, people, team names and acronyms you mention often. Included with every summary and report, so it can make sense of what you say and spell names right.")),
     setup ? el("section", { class: "card" },
       el("h2", {}, "Choose a PIN"),
       el("p", { class: "muted small" }, "You'll type this to unlock the app. Use 6+ digits."),
@@ -682,7 +685,10 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
     error.textContent = "";
     const provider = form.querySelector("input[type=radio]:checked")?.value || "ollama";
     const body = {
-      profile: { name: f.name.value.trim(), role: f.role.value.trim(), company: f.company.value.trim(), goals: f.goals.value.trim() },
+      profile: {
+        name: f.name.value.trim(), role: f.role.value.trim(), company: f.company.value.trim(),
+        goals: f.goals.value.trim(), context: f.context.value.trim(),
+      },
       ai: {
         provider,
         ollama_url: f.ollamaUrl.value.trim(),

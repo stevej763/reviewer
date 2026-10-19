@@ -38,6 +38,9 @@ def about_me(profile: dict) -> str:
         parts.append(f"Team / company: {profile['company']}")
     if profile.get("goals"):
         parts.append(f"Current goals and what matters in my role: {profile['goals']}")
+    if profile.get("context"):
+        parts.append("Background about my work (projects, people, acronyms; use it to interpret what I say "
+                     f"and spell names correctly):\n{profile['context']}")
     return "\n".join(parts)
 
 

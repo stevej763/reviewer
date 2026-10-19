@@ -52,6 +52,7 @@ class ProfileIn(BaseModel):
     role: str = Field(default="", max_length=200)
     company: str = Field(default="", max_length=200)
     goals: str = Field(default="", max_length=2000)
+    context: str = Field(default="", max_length=6000)
 
 
 class AiIn(BaseModel):

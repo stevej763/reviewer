@@ -53,7 +53,8 @@ def entry(c, entry_id):
 
 
 SETUP = {
-    "profile": {"name": "Steve", "role": "Engineer", "company": "Acme", "goals": "Get promoted"},
+    "profile": {"name": "Steve", "role": "Engineer", "company": "Acme", "goals": "Get promoted",
+                "context": "PSP = payment service provider"},
     "pin": PIN,
     "ai": {"provider": "ollama", "ollama_url": "http://host.docker.internal:11434", "ollama_model": "qwen3:8b",
            "anthropic_api_key": "sk-ant-secret-1234", "anthropic_model": "claude-opus-5-5"},
@@ -133,6 +134,7 @@ def test_profile_reaches_prompts(make_client):
     c.post("/api/login", json={"pin": PIN})
     c.post("/api/entries", json={"date": "2026-10-01", "text": "x"})
     assert "Role: Engineer" in fake.prompts[0] and "Get promoted" in fake.prompts[0]
+    assert "PSP = payment service provider" in fake.prompts[0]
 
 
 def test_build_providers_from_settings():
