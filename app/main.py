@@ -399,9 +399,12 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         summary = None
         if body.summary is not None:
             summary = normalize_summary(body.summary)
+        before = store.get_entry(entry_id)
         entry = store.update_entry(entry_id, entry_date=body.date, text=body.text, summary=summary)
         if not entry:
             raise HTTPException(404, "Entry not found")
+        for day in {before["date"], entry["date"]}:
+            worker.enqueue_day(day)
         return entry
 
     @app.post("/api/entries/{entry_id}/summarize", dependencies=[Depends(require_login)])
@@ -430,10 +433,36 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.delete("/api/entries/{entry_id}", dependencies=[Depends(require_login)])
     def delete_entry(entry_id: int):
-        if not store.delete_entry(entry_id):
+        entry = store.get_entry(entry_id)
+        if not entry or not store.delete_entry(entry_id):
             raise HTTPException(404, "Entry not found")
         audio_store.delete(entry_id)
+        worker.enqueue_day(entry["date"])
         return {"ok": True}
+
+    # ---- end-of-day summaries --------------------------------------------
+
+    def _day_out(day: dict) -> dict:
+        return {k: v for k, v in day.items() if k != "fingerprint"}
+
+    @app.get("/api/days", dependencies=[Depends(require_login)])
+    def list_days(start: str | None = None, end: str | None = None):
+        return [_day_out(d) for d in store.list_days(start, end)]
+
+    @app.get("/api/days/{entry_date}", dependencies=[Depends(require_login)])
+    def get_day(entry_date: str):
+        day = store.get_day(entry_date)
+        if not day:
+            raise HTTPException(404, "No end-of-day summary for that date")
+        return _day_out(day)
+
+    @app.post("/api/days/{entry_date}/refresh", dependencies=[Depends(require_login)])
+    def refresh_day(entry_date: str):
+        if not store.get_day(entry_date):
+            raise HTTPException(404, "No end-of-day summary for that date")
+        store.save_day(entry_date, status="summarising")
+        worker.enqueue_day(entry_date, force=True)
+        return _day_out(store.get_day(entry_date))
 
     # ---- reports ---------------------------------------------------------
 

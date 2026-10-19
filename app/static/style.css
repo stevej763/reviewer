@@ -271,3 +271,7 @@ details pre { white-space: pre-wrap; font: inherit; font-size: .92rem; margin: .
   font-size: .88rem; font-weight: 600; color: var(--muted); cursor: pointer;
 }
 .segmented button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+
+/* End-of-day card */
+.day-summary { border-color: var(--accent); background: linear-gradient(var(--accent-soft), var(--surface) 140px); }
+.day-label { font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .05em; font-size: .8rem; }

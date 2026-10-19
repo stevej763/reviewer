@@ -9,7 +9,7 @@ import anthropic
 import httpx
 
 from .config import Settings
-from .prompts import CATEGORIES, SUMMARY_SCHEMA, SUMMARY_SYSTEM
+from .prompts import CATEGORIES, DAY_SYSTEM, SUMMARY_SCHEMA, SUMMARY_SYSTEM
 
 
 class ProviderError(RuntimeError):
@@ -20,8 +20,16 @@ class Provider:
     name: str
     model: str
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "") -> dict:
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
         raise NotImplementedError
+
+    def summarize_day(self, entries: list[dict], entry_date: str, about_me: str = "") -> dict:
+        """One end-of-day summary from all of a day's entries (oldest first)."""
+        parts = []
+        for i, entry in enumerate(entries, 1):
+            time = entry["created_at"][11:16]
+            parts.append(f"<entry number=\"{i}\" recorded_at=\"{time} UTC\">\n{entry['text'].strip()}\n</entry>")
+        return self.summarize("\n\n".join(parts), entry_date, about_me, system=DAY_SYSTEM)
 
     def write(self, system: str, prompt: str) -> str:
         raise NotImplementedError
@@ -111,12 +119,12 @@ class ClaudeProvider(Provider):
         except anthropic.APIConnectionError as exc:
             raise ProviderError("Couldn't reach the Claude API.") from exc
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "") -> dict:
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
         response = self._call(
             self._client.beta.messages.create,
             model=self.model,
             max_tokens=16000,
-            system=SUMMARY_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": _summary_prompt(text, entry_date, about_me)}],
             output_config={"effort": self._effort, "format": {"type": "json_schema", "schema": SUMMARY_SCHEMA}},
             **self._extra(),
@@ -209,8 +217,8 @@ class OllamaProvider(Provider):
         self.model = model
         self.client = OllamaClient(url)
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "") -> dict:
-        system = SUMMARY_SYSTEM + "\n\nRespond with a single JSON object matching the schema."
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
+        system = system + "\n\nRespond with a single JSON object matching the schema."
         raw = self.client.chat(self.model, system, _summary_prompt(text, entry_date, about_me),
                                fmt=SUMMARY_SCHEMA, output_tokens=2048)
         try:

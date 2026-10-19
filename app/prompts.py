@@ -67,6 +67,18 @@ Fields:
 Use empty lists where nothing applies. Ignore small talk that isn't about work."""
 
 
+DAY_SYSTEM = """You combine several log entries someone recorded during one work day into a single
+end-of-day summary, in the same format as each entry's summary.
+
+The entries were recorded at different times, so they overlap: the same piece of work may come up more
+than once, or be updated later in the day (started in the morning, finished in the afternoon). Merge
+these into one highlight that reflects the latest state, and connect related items. Keep every distinct
+contribution; drop exact repeats. Never invent anything that isn't in the entries.
+
+Write in the first person, past tense, concise and specific. The headline sums up the whole day.
+Follow-ups should only list things still outstanding at the end of the day."""
+
+
 REPORT_STYLES = {
     "review": {
         "label": "Performance review",

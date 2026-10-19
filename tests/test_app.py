@@ -18,7 +18,7 @@ class FakeProvider(Provider):
         self.fail = fail
         self.prompts = []
 
-    def summarize(self, text, entry_date, about_me=""):
+    def summarize(self, text, entry_date, about_me="", system=None):
         self.prompts.append(about_me)
         if self.fail:
             raise ProviderError("boom")
@@ -334,3 +334,47 @@ def test_ollama_context_size():
     assert _context_size("a" * 100, output_tokens=2048) == 8192
     assert _context_size("a" * 60000, output_tokens=4096) == 32768
     assert _context_size("a" * 10_000_000, output_tokens=4096) == 65536
+
+
+def test_end_of_day_summary(make_client):
+    fake = FakeProvider()
+    c, _ = make_client({"claude": fake})
+    c.post("/api/login", json={"pin": PIN})
+    first = c.post("/api/entries", json={"date": "2026-10-19", "text": "Morning: started the deploy fix"}).json()
+    assert c.get("/api/days/2026-10-19").status_code == 404  # one entry is its own summary
+
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "Afternoon: deploy fix shipped"})
+    day = c.get("/api/days/2026-10-19").json()
+    assert day["status"] == "done" and day["entry_count"] == 2 and day["summary"]["headline"]
+    assert "fingerprint" not in day
+    combined = fake.prompts  # about_me per call; the day call sees both entries in the text
+    calls = len(combined)
+
+    # Nothing changed: no rebuild
+    c.get("/api/entries")
+    assert len(fake.prompts) == calls
+    # Forced refresh rebuilds
+    c.post("/api/days/2026-10-19/refresh")
+    assert len(fake.prompts) == calls + 1
+
+    # Moving an entry to another day drops the day back to a single entry
+    c.put(f"/api/entries/{first['id']}", json={"date": "2026-10-18"})
+    assert c.get("/api/days/2026-10-19").status_code == 404
+    assert [d["date"] for d in c.get("/api/days").json()] == []
+
+
+def test_day_summary_input_includes_every_entry():
+    from app.llm import Provider
+    seen = {}
+
+    class Capture(Provider):
+        name, model = "x", "y"
+
+        def summarize(self, text, entry_date, about_me="", system=None):
+            seen.update(text=text, system=system)
+            return {}
+
+    Capture().summarize_day([{"text": "one", "created_at": "2026-10-19T09:05:00+00:00"},
+                             {"text": "two", "created_at": "2026-10-19T15:30:00+00:00"}], "2026-10-19")
+    assert 'recorded_at="09:05 UTC"' in seen["text"] and "two" in seen["text"]
+    assert "end-of-day" in seen["system"]

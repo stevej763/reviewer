@@ -244,6 +244,53 @@ $("#record").addEventListener("click", () => {
 
 const PENDING = { transcribing: "Transcribing your recording…", summarising: "Writing your highlights…" };
 
+function summaryParts(s) {
+  const parts = [];
+  if (s.headline) parts.push(el("div", { class: "headline" }, s.headline));
+  if (s.highlights.length) {
+    parts.push(el("ul", { class: "highlights" }, s.highlights.map((h) => el("li", {},
+      el("div", {}, el("span", { class: "tag" }, h.category), h.text),
+      h.impact ? el("div", { class: "impact" }, h.impact) : null))));
+  }
+  const facts = [["Wins", s.wins], ["Projects", s.projects], ["People", s.people],
+    ["Challenges", s.challenges], ["Follow-ups", s.follow_ups]].filter(([, v]) => v && v.length);
+  if (facts.length) {
+    parts.push(el("div", { class: "facts" }, facts.map(([k, v]) => el("div", {}, el("b", {}, `${k}: `), v.join(" · ")))));
+  }
+  if (s.tags.length) parts.push(el("div", {}, s.tags.map((t) => el("span", { class: "tag" }, t))));
+  return parts;
+}
+
+// The end-of-day summary combining all of a day's entries (only exists for 2+ entries).
+function renderDay(day) {
+  const card = el("article", { class: "card entry day-summary", "data-day": day.date, "data-status": day.status });
+  const busyNow = day.status === "summarising";
+  card.append(el("div", { class: "entry-head" },
+    el("span", { class: "day-label" }, "End of day"),
+    el("span", { class: "entry-meta" }, `${prettyDate(day.date)} · ${day.entry_count} entries`)));
+  if (busyNow) {
+    card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
+      el("b", {}, day.summary ? "Updating with your latest entry…" : "Combining today's entries…")));
+    watchPending();
+  }
+  if (day.status === "failed") card.append(el("div", { class: "warn" }, day.error || "Couldn't build the end-of-day summary."));
+  if (day.summary) card.append(...summaryParts(day.summary));
+  if (!busyNow) {
+    card.append(el("div", { class: "entry-actions" }, el("button", {
+      class: "btn",
+      onclick: async () => {
+        try { card.replaceWith(renderDay(await api(`/api/days/${day.date}/refresh`, { method: "POST" }))); }
+        catch (err) { toast(err.message); }
+      },
+    }, "Rebuild")));
+  }
+  return card;
+}
+
+async function fetchDays(start, end) {
+  try { return await api(`/api/days?start=${start}&end=${end}`); } catch { return []; }
+}
+
 function renderSummary(entry, { onChange } = {}) {
   const s = entry.summary;
   const card = el("article", { class: "card entry", "data-entry-id": entry.id, "data-status": entry.status });
@@ -274,20 +321,7 @@ function renderSummary(entry, { onChange } = {}) {
       }, "Try again")));
   }
 
-  if (s) {
-    if (s.headline) card.append(el("div", { class: "headline" }, s.headline));
-    if (s.highlights.length) {
-      card.append(el("ul", { class: "highlights" }, s.highlights.map((h) => el("li", {},
-        el("div", {}, el("span", { class: "tag" }, h.category), h.text),
-        h.impact ? el("div", { class: "impact" }, h.impact) : null))));
-    }
-    const facts = [["Wins", s.wins], ["Projects", s.projects], ["People", s.people],
-      ["Challenges", s.challenges], ["Follow-ups", s.follow_ups]].filter(([, v]) => v && v.length);
-    if (facts.length) {
-      card.append(el("div", { class: "facts" }, facts.map(([k, v]) => el("div", {}, el("b", {}, `${k}: `), v.join(" · ")))));
-    }
-    if (s.tags.length) card.append(el("div", {}, s.tags.map((t) => el("span", { class: "tag" }, t))));
-  }
+  if (s) card.append(...summaryParts(s));
 
   if (entry.text) card.append(el("details", {}, el("summary", {}, "What you said"), el("pre", {}, entry.text)));
 
@@ -337,16 +371,27 @@ function watchPending() {
     pendingTimer = null;
     const cards = [...document.querySelectorAll('.entry[data-status="transcribing"], .entry[data-status="summarising"]')];
     if (!cards.length) return;
+    let entryFinished = false;
     for (const card of cards) {
+      if (card.dataset.day) {
+        try {
+          const day = await api(`/api/days/${card.dataset.day}`);
+          if (day.status !== card.dataset.status) card.replaceWith(renderDay(day));
+        } catch { card.remove(); /* day no longer has a combined summary */ }
+        continue;
+      }
       try {
         const entry = await api(`/api/entries/${card.dataset.entryId}`);
         if (entry.status !== card.dataset.status) {
           card.replaceWith(renderSummary(entry, card._opts));
+          entryFinished = true;
           if (entry.status === "done") toast("Highlights ready");
           if (entry.status === "failed") toast("An entry couldn't be processed");
         }
       } catch { /* try again next round */ }
     }
+    // A finished entry may start (or update) the day's combined summary.
+    if (entryFinished && !$("#view-log").hidden) await refreshDayCard();
     if (document.querySelector('.entry[data-status="transcribing"], .entry[data-status="summarising"]')) watchPending();
   }, 3000);
 }
@@ -407,9 +452,23 @@ $("#entry-text").addEventListener("input", (e) => {
 async function loadLatest() {
   const day = $("#entry-date").value || today();
   try {
-    const entries = await api(`/api/entries?start=${day}&end=${day}`);
-    $("#latest").replaceChildren(...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
+    const [entries, days] = await Promise.all([api(`/api/entries?start=${day}&end=${day}`), fetchDays(day, day)]);
+    $("#latest").replaceChildren(...days.map(renderDay), ...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
   } catch { /* shown elsewhere */ }
+}
+
+// Shows, updates or removes the selected day's end-of-day card on the Log view.
+async function refreshDayCard(retry = true) {
+  const day = $("#entry-date").value || today();
+  const [summary] = await fetchDays(day, day);
+  const existing = $("#latest .day-summary");
+  if (summary) {
+    const card = renderDay(summary);
+    existing ? existing.replaceWith(card) : $("#latest").prepend(card);
+  } else if (existing) existing.remove();
+  // If it isn't there yet the worker may not have started on it; look once more shortly.
+  // (While it's being built, the card's own polling takes over.)
+  if (!summary && retry) setTimeout(() => { if (!$("#view-log").hidden) refreshDayCard(false); }, 4000);
 }
 $("#entry-date").addEventListener("change", loadLatest);
 
@@ -426,8 +485,18 @@ async function loadHistory() {
   try {
     const entries = await api(`/api/entries?${params}`);
     $("#hist-count").textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
-    list.replaceChildren(...(entries.length
-      ? entries.map((e) => renderSummary(e, { onChange: loadHistory }))
+    const dates = entries.map((e) => e.date);
+    const days = entries.length ? await fetchDays(dates[dates.length - 1], dates[0]) : [];
+    const byDate = Object.fromEntries(days.map((d) => [d.date, d]));
+    // Each day with several entries starts with its end-of-day card.
+    const cards = [];
+    let lastDate = null;
+    for (const e of entries) {
+      if (e.date !== lastDate && byDate[e.date]) cards.push(renderDay(byDate[e.date]));
+      lastDate = e.date;
+      cards.push(renderSummary(e, { onChange: loadHistory }));
+    }
+    list.replaceChildren(...(cards.length ? cards
       : [el("p", { class: "empty" }, "Nothing logged yet. Head to Log and talk about your day.")]));
   } catch (err) { toast(err.message); }
 }

@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(entry_date);
 
+CREATE TABLE IF NOT EXISTS day_summaries (
+    entry_date TEXT PRIMARY KEY,
+    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    summary BLOB,
+    fingerprint TEXT,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    model TEXT
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -174,6 +186,79 @@ class Store:
         with self._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
         return [self._entry(r) for r in rows]
+
+    # ---- end-of-day summaries -------------------------------------------
+
+    def _day(self, row) -> dict:
+        return {
+            "date": row["entry_date"],
+            "updated_at": row["updated_at"],
+            "status": row["status"],
+            "error": row["error"],
+            "summary": json.loads(self.box.open(row["summary"])) if row["summary"] else None,
+            "fingerprint": row["fingerprint"],
+            "entry_count": row["entry_count"],
+            "provider": row["provider"],
+            "model": row["model"],
+        }
+
+    def get_day(self, entry_date: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM day_summaries WHERE entry_date=?", (entry_date,)).fetchone()
+        return self._day(row) if row else None
+
+    def list_days(self, start: str | None = None, end: str | None = None) -> list[dict]:
+        sql, args = "SELECT * FROM day_summaries WHERE 1=1", []
+        if start:
+            sql += " AND entry_date >= ?"
+            args.append(start)
+        if end:
+            sql += " AND entry_date <= ?"
+            args.append(end)
+        with self._conn() as conn:
+            rows = conn.execute(sql + " ORDER BY entry_date DESC", args).fetchall()
+        return [self._day(r) for r in rows]
+
+    def save_day(self, entry_date: str, *, status: str, error: str | None = None, summary: dict | None = None,
+                 fingerprint: str | None = None, entry_count: int | None = None, provider: str | None = None,
+                 model: str | None = None) -> None:
+        """Upsert; fields left as None keep their stored value (so a refresh keeps the old summary)."""
+        current = self.get_day(entry_date) or {}
+        values = {
+            "summary": summary if summary is not None else current.get("summary"),
+            "fingerprint": fingerprint if fingerprint is not None else current.get("fingerprint"),
+            "entry_count": entry_count if entry_count is not None else current.get("entry_count", 0),
+            "provider": provider or current.get("provider"),
+            "model": model or current.get("model"),
+        }
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO day_summaries (entry_date, updated_at, status, error, summary, fingerprint, entry_count, "
+                "provider, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(entry_date) DO UPDATE SET "
+                "updated_at=excluded.updated_at, status=excluded.status, error=excluded.error, "
+                "summary=excluded.summary, fingerprint=excluded.fingerprint, entry_count=excluded.entry_count, "
+                "provider=excluded.provider, model=excluded.model",
+                (entry_date, _now(), status, error,
+                 self.box.seal(json.dumps(values["summary"])) if values["summary"] else None,
+                 values["fingerprint"], values["entry_count"], values["provider"], values["model"]),
+            )
+
+    def delete_day(self, entry_date: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM day_summaries WHERE entry_date=?", (entry_date,))
+
+    def days_needing_summary(self) -> list[str]:
+        """Days with 2+ finished entries but no end-of-day summary yet (e.g. from before the feature)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT entry_date FROM entries WHERE status='done' GROUP BY entry_date HAVING COUNT(*) >= 2 "
+                "EXCEPT SELECT entry_date FROM day_summaries").fetchall()
+        return [r["entry_date"] for r in rows]
+
+    def pending_days(self) -> list[str]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT entry_date FROM day_summaries WHERE status='summarising'").fetchall()
+        return [r["entry_date"] for r in rows]
 
     # ---- reports -------------------------------------------------------
 

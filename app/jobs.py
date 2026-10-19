@@ -6,8 +6,12 @@ can close the page. Work happens one item at a time on a single worker thread
 the database, so anything unfinished is picked up again after a restart.
 
 Entry statuses: transcribing -> summarising -> done, or failed (with an error).
+
+When a day has two or more finished entries, an end-of-day summary combining them is
+(re)built after any of that day's entries changes.
 """
 
+import json
 import logging
 import queue
 import threading
@@ -61,30 +65,76 @@ class Worker:
         self._transcribe = transcribe
         self._pick_provider = pick_provider
         self._about_me = about_me
-        self._queue: queue.Queue[int] = queue.Queue()
+        self._queue: queue.Queue[tuple[str, int | str]] = queue.Queue()
+        self._queued_days: set[str] = set()
+        self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         for entry_id in self._store.pending_entry_ids():
-            self._queue.put(entry_id)
+            self.enqueue(entry_id)
+        for day in self._store.pending_days() + self._store.days_needing_summary():
+            self.enqueue_day(day)
         self._thread = threading.Thread(target=self._loop, name="reviewer-worker", daemon=True)
         self._thread.start()
 
     def enqueue(self, entry_id: int) -> None:
-        self._queue.put(entry_id)
+        self._queue.put(("entry", entry_id))
+
+    def enqueue_day(self, entry_date: str, force: bool = False) -> None:
+        """Queue a rebuild of a day's end-of-day summary (no-op if one is already queued)."""
+        with self._lock:
+            if entry_date in self._queued_days:
+                return
+            self._queued_days.add(entry_date)
+        self._queue.put(("day-force" if force else "day", entry_date))
 
     def drain(self) -> None:
         """Process everything queued right now, on the calling thread (used by tests)."""
         while not self._queue.empty():
-            self.process(self._queue.get())
+            self._run(*self._queue.get())
 
     def _loop(self) -> None:
         while True:
-            entry_id = self._queue.get()
+            kind, key = self._queue.get()
             try:
-                self.process(entry_id)
-            except Exception:  # never let one bad entry kill the worker
-                log.exception("processing entry %s failed", entry_id)
+                self._run(kind, key)
+            except Exception:  # never let one bad item kill the worker
+                log.exception("processing %s %s failed", kind, key)
+
+    def _run(self, kind: str, key) -> None:
+        if kind == "entry":
+            self.process(key)
+            entry = self._store.get_entry(key)
+            if entry and entry["status"] in ("done", "failed"):
+                self.enqueue_day(entry["date"])
+        else:
+            with self._lock:
+                self._queued_days.discard(key)
+            self.process_day(key, force=kind == "day-force")
+
+    def process_day(self, entry_date: str, force: bool = False) -> None:
+        entries = [e for e in self._store.list_entries(entry_date, entry_date)
+                   if e["status"] == "done" and e["text"].strip()]
+        if len(entries) < 2:
+            self._store.delete_day(entry_date)  # a single entry is its own summary
+            return
+        entries.sort(key=lambda e: e["id"])
+        fingerprint = json.dumps([[e["id"], e["updated_at"]] for e in entries])
+        current = self._store.get_day(entry_date)
+        if not force and current and current["status"] == "done" and current["fingerprint"] == fingerprint:
+            return  # nothing changed since the last build
+        self._store.save_day(entry_date, status="summarising", entry_count=len(entries))
+        try:
+            provider = self._pick_provider(None)
+            summary = provider.summarize_day(entries, entry_date, self._about_me())
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc) or exc.__class__.__name__
+            log.warning("end-of-day summary for %s failed: %s", entry_date, detail)
+            self._store.save_day(entry_date, status="failed", error=detail)
+            return
+        self._store.save_day(entry_date, status="done", summary=summary, fingerprint=fingerprint,
+                             entry_count=len(entries), provider=provider.name, model=provider.model)
 
     def process(self, entry_id: int) -> None:
         entry = self._store.get_entry(entry_id)
