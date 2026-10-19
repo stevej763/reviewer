@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#16181d" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Reviewer">
+  <title>Reviewer</title>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <!-- Login -->
+  <main id="login" class="login" hidden>
+    <div class="login-card">
+      <img class="brand-mark" src="/static/icon.svg" alt="">
+      <h1>Reviewer</h1>
+      <p class="muted">Enter your PIN</p>
+      <form id="login-form" autocomplete="off">
+        <input id="pin" type="password" inputmode="numeric" autocomplete="current-password"
+               aria-label="PIN" placeholder="••••" maxlength="64" required>
+        <button class="btn primary wide" type="submit">Unlock</button>
+      </form>
+      <p id="login-error" class="error" role="alert"></p>
+    </div>
+  </main>
+
+  <!-- App -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <h1 class="title" id="view-title">Today</h1>
+      <button class="icon-btn" id="logout" aria-label="Lock">Lock</button>
+    </header>
+
+    <!-- Log view -->
+    <section id="view-log" class="view">
+      <div class="card">
+        <label class="field-row">
+          <span>Day</span>
+          <input type="date" id="entry-date">
+        </label>
+
+        <div class="recorder">
+          <button id="record" class="record-btn" aria-label="Start recording">
+            <span class="record-dot"></span>
+          </button>
+          <div class="record-status">
+            <div id="record-label">Tap to talk about your day</div>
+            <div id="record-timer" class="muted mono"></div>
+          </div>
+        </div>
+
+        <textarea id="entry-text" rows="8"
+          placeholder="Or type here. Brain-dump everything: what you worked on, who you helped, what went well, what got in the way…"></textarea>
+
+        <div class="actions">
+          <select id="entry-provider" class="provider-select" aria-label="AI model"></select>
+          <button id="save-entry" class="btn primary">Summarise &amp; save</button>
+        </div>
+        <p id="log-error" class="error" role="alert"></p>
+      </div>
+
+      <div id="latest"></div>
+    </section>
+
+    <!-- History view -->
+    <section id="view-history" class="view" hidden>
+      <div class="filters">
+        <input type="date" id="hist-start" aria-label="From">
+        <span class="muted">to</span>
+        <input type="date" id="hist-end" aria-label="To">
+        <button id="hist-apply" class="btn small">Filter</button>
+      </div>
+      <div class="toolbar">
+        <span id="hist-count" class="muted"></span>
+        <a id="export-csv" class="link" href="/api/export/highlights.csv">Export CSV</a>
+      </div>
+      <div id="history-list"></div>
+    </section>
+
+    <!-- Reports view -->
+    <section id="view-reports" class="view" hidden>
+      <div class="card">
+        <h2>New report</h2>
+        <div class="chips" id="range-presets">
+          <button class="chip" data-range="week">Last 7 days</button>
+          <button class="chip" data-range="month">Last 30 days</button>
+          <button class="chip" data-range="quarter">This quarter</button>
+          <button class="chip" data-range="half">Last 6 months</button>
+          <button class="chip" data-range="year">This year</button>
+        </div>
+        <div class="grid2">
+          <label>From <input type="date" id="rep-start"></label>
+          <label>To <input type="date" id="rep-end"></label>
+        </div>
+        <label>Type <select id="rep-style"></select></label>
+        <label>Anything to emphasise? <span class="muted">(optional)</span>
+          <textarea id="rep-notes" rows="2" placeholder="e.g. focus on leadership, I'm going for promotion"></textarea>
+        </label>
+        <div class="actions">
+          <select id="rep-provider" class="provider-select" aria-label="AI model"></select>
+          <button id="make-report" class="btn primary">Generate report</button>
+        </div>
+        <p id="rep-error" class="error" role="alert"></p>
+      </div>
+
+      <div id="report-view"></div>
+
+      <h2 class="section-title">Past reports</h2>
+      <div id="report-list"></div>
+    </section>
+
+    <nav class="tabbar">
+      <button data-view="log" class="active"><span class="tab-icon" aria-hidden="true">●</span>Log</button>
+      <button data-view="history"><span class="tab-icon" aria-hidden="true">≡</span>History</button>
+      <button data-view="reports"><span class="tab-icon" aria-hidden="true">▤</span>Reports</button>
+    </nav>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

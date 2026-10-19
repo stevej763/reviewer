@@ -1,0 +1,14 @@
+{
+  "name": "Reviewer",
+  "short_name": "Reviewer",
+  "description": "Talk about your workday; get highlights and reports.",
+  "start_url": "/#log",
+  "display": "standalone",
+  "background_color": "#f6f4ef",
+  "theme_color": "#2f6f5e",
+  "icons": [
+    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/static/icon-180.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

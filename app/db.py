@@ -1,0 +1,172 @@
+"""SQLite storage. Dates and ids are plain columns; all content is encrypted."""
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .crypto import Box
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    raw_text BLOB NOT NULL,
+    summary BLOB,
+    provider TEXT,
+    model TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(entry_date);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    style TEXT NOT NULL,
+    title BLOB NOT NULL,
+    content BLOB NOT NULL,
+    provider TEXT,
+    model TEXT
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Store:
+    def __init__(self, path: Path, box: Box):
+        self.path = path
+        self.box = box
+        with self._conn() as conn:
+            conn.executescript(SCHEMA)
+        path.chmod(0o600)
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ---- entries -------------------------------------------------------
+
+    def _entry(self, row) -> dict:
+        return {
+            "id": row["id"],
+            "date": row["entry_date"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "text": self.box.open(row["raw_text"]),
+            "summary": json.loads(self.box.open(row["summary"])) if row["summary"] else None,
+            "provider": row["provider"],
+            "model": row["model"],
+        }
+
+    def add_entry(self, entry_date: str, text: str, summary: dict | None, provider: str | None, model: str | None) -> dict:
+        now = _now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO entries (entry_date, created_at, updated_at, raw_text, summary, provider, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (entry_date, now, now, self.box.seal(text),
+                 self.box.seal(json.dumps(summary)) if summary else None, provider, model),
+            )
+            entry_id = cur.lastrowid
+        return self.get_entry(entry_id)
+
+    def update_entry(self, entry_id: int, *, entry_date: str | None = None, text: str | None = None,
+                     summary: dict | None = None, provider: str | None = None, model: str | None = None) -> dict | None:
+        current = self.get_entry(entry_id)
+        if not current:
+            return None
+        new_summary = summary if summary is not None else current["summary"]
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE entries SET entry_date=?, raw_text=?, summary=?, provider=?, model=?, updated_at=? WHERE id=?",
+                (
+                    entry_date or current["date"],
+                    self.box.seal(text if text is not None else current["text"]),
+                    self.box.seal(json.dumps(new_summary)) if new_summary else None,
+                    provider or current["provider"],
+                    model or current["model"],
+                    _now(),
+                    entry_id,
+                ),
+            )
+        return self.get_entry(entry_id)
+
+    def get_entry(self, entry_id: int) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+        return self._entry(row) if row else None
+
+    def delete_entry(self, entry_id: int) -> bool:
+        with self._conn() as conn:
+            return conn.execute("DELETE FROM entries WHERE id=?", (entry_id,)).rowcount > 0
+
+    def list_entries(self, start: str | None = None, end: str | None = None, limit: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM entries WHERE 1=1"
+        args: list = []
+        if start:
+            sql += " AND entry_date >= ?"
+            args.append(start)
+        if end:
+            sql += " AND entry_date <= ?"
+            args.append(end)
+        sql += " ORDER BY entry_date DESC, id DESC"
+        if limit:
+            sql += " LIMIT ?"
+            args.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._entry(r) for r in rows]
+
+    # ---- reports -------------------------------------------------------
+
+    def _report(self, row, with_content: bool = True) -> dict:
+        report = {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "start": row["start_date"],
+            "end": row["end_date"],
+            "style": row["style"],
+            "title": self.box.open(row["title"]),
+            "provider": row["provider"],
+            "model": row["model"],
+        }
+        if with_content:
+            report["content"] = self.box.open(row["content"])
+        return report
+
+    def add_report(self, start: str, end: str, style: str, title: str, content: str, provider: str, model: str) -> dict:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO reports (created_at, start_date, end_date, style, title, content, provider, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now(), start, end, style, self.box.seal(title), self.box.seal(content), provider, model),
+            )
+            report_id = cur.lastrowid
+        return self.get_report(report_id)
+
+    def get_report(self, report_id: int) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        return self._report(row) if row else None
+
+    def list_reports(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM reports ORDER BY id DESC").fetchall()
+        return [self._report(r, with_content=False) for r in rows]
+
+    def delete_report(self, report_id: int) -> bool:
+        with self._conn() as conn:
+            return conn.execute("DELETE FROM reports WHERE id=?", (report_id,)).rowcount > 0

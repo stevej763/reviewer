@@ -1,0 +1,34 @@
+services:
+  reviewer:
+    build: .
+    image: reviewer:latest
+    container_name: reviewer
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${REVIEWER_PORT:-8000}:8000"
+    volumes:
+      - reviewer-data:/data
+
+  # Optional local model. Start with: docker compose --profile ollama up -d
+  # then pull a model: docker compose exec ollama ollama pull llama3.1:8b
+  # and set OLLAMA_URL=http://ollama:11434 in .env.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: reviewer-ollama
+    restart: unless-stopped
+    profiles: ["ollama"]
+    volumes:
+      - ollama-models:/root/.ollama
+    # Uncomment to use an NVIDIA GPU (needs the NVIDIA container toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  reviewer-data:
+  ollama-models:
