@@ -247,14 +247,6 @@ class Store:
         with self._conn() as conn:
             conn.execute("DELETE FROM day_summaries WHERE entry_date=?", (entry_date,))
 
-    def days_needing_summary(self) -> list[str]:
-        """Days with 2+ finished entries but no end-of-day summary yet (e.g. from before the feature)."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT entry_date FROM entries WHERE status='done' GROUP BY entry_date HAVING COUNT(*) >= 2 "
-                "EXCEPT SELECT entry_date FROM day_summaries").fetchall()
-        return [r["entry_date"] for r in rows]
-
     def pending_days(self) -> list[str]:
         with self._conn() as conn:
             rows = conn.execute("SELECT entry_date FROM day_summaries WHERE status='summarising'").fetchall()

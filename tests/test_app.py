@@ -18,7 +18,7 @@ class FakeProvider(Provider):
         self.fail = fail
         self.prompts = []
 
-    def summarize(self, text, entry_date, about_me="", system=None):
+    def summarize(self, text, entry_date, about_me="", system=None, cancel=None):
         self.prompts.append(about_me)
         if self.fail:
             raise ProviderError("boom")
@@ -336,31 +336,88 @@ def test_ollama_context_size():
     assert _context_size("a" * 10_000_000, output_tokens=4096) == 65536
 
 
-def test_end_of_day_summary(make_client):
+def test_end_of_day_summary_is_on_demand(make_client):
     fake = FakeProvider()
     c, _ = make_client({"claude": fake})
     c.post("/api/login", json={"pin": PIN})
     first = c.post("/api/entries", json={"date": "2026-10-19", "text": "Morning: started the deploy fix"}).json()
-    assert c.get("/api/days/2026-10-19").status_code == 404  # one entry is its own summary
+    assert c.post("/api/days/2026-10-19/generate").status_code == 400  # needs two entries
 
     c.post("/api/entries", json={"date": "2026-10-19", "text": "Afternoon: deploy fix shipped"})
+    assert c.get("/api/days/2026-10-19").status_code == 404  # not built automatically
+    calls = len(fake.prompts)
+    day = c.post("/api/days/2026-10-19/generate").json()
+    assert len(fake.prompts) == calls + 1
     day = c.get("/api/days/2026-10-19").json()
     assert day["status"] == "done" and day["entry_count"] == 2 and day["summary"]["headline"]
-    assert "fingerprint" not in day
-    combined = fake.prompts  # about_me per call; the day call sees both entries in the text
-    calls = len(combined)
+    assert "fingerprint" not in day and day["stale"] is False
 
-    # Nothing changed: no rebuild
-    c.get("/api/entries")
-    assert len(fake.prompts) == calls
-    # Forced refresh rebuilds
-    c.post("/api/days/2026-10-19/refresh")
-    assert len(fake.prompts) == calls + 1
+    # A third entry makes it out of date, but doesn't rebuild it
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "Evening: release notes"})
+    assert c.get("/api/days/2026-10-19").json()["stale"] is True
+    assert len(fake.prompts) == calls + 2  # just the new entry's own summary
 
-    # Moving an entry to another day drops the day back to a single entry
+    # Moving entries away so only one is left removes the day summary
     c.put(f"/api/entries/{first['id']}", json={"date": "2026-10-18"})
+    assert c.get("/api/days/2026-10-19").status_code == 200
+    third = [e for e in c.get("/api/entries").json() if e["text"].startswith("Evening")][0]
+    c.delete(f"/api/entries/{third['id']}")
     assert c.get("/api/days/2026-10-19").status_code == 404
-    assert [d["date"] for d in c.get("/api/days").json()] == []
+
+
+def test_cancel_summaries(make_client):
+    c, _ = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    worker = c.app.state.worker
+    # Queued but not started: cancelling skips it.
+    eid = TestClient.request(c, "POST", "/api/entries", json={"date": "2026-10-19", "text": "x"}).json()["id"]
+    assert TestClient.request(c, "POST", f"/api/entries/{eid}/cancel").status_code == 200
+    worker.drain()
+    e = entry(c, eid)
+    assert e["status"] == "failed" and "cancelled" in e["error"].lower() and e["summary"] is None
+    assert c.post(f"/api/entries/{eid}/cancel").status_code == 409  # nothing running now
+    c.post(f"/api/entries/{eid}/retry")
+    assert entry(c, eid)["status"] == "done"
+
+    # Day summary cancelled before it ever finished: it goes away
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "y"})
+    TestClient.request(c, "POST", "/api/days/2026-10-19/generate")
+    TestClient.request(c, "POST", "/api/days/2026-10-19/cancel")
+    worker.drain()
+    assert c.get("/api/days/2026-10-19").status_code == 404
+    # Cancelling a rebuild keeps the previous summary
+    c.post("/api/days/2026-10-19/generate")
+    TestClient.request(c, "POST", "/api/days/2026-10-19/generate")
+    TestClient.request(c, "POST", "/api/days/2026-10-19/cancel")
+    worker.drain()
+    day = c.get("/api/days/2026-10-19").json()
+    assert day["status"] == "done" and day["summary"]
+
+
+def test_running_ollama_summary_stops_on_cancel():
+    import threading
+    from app.llm import Cancelled, OllamaClient
+
+    cancel = threading.Event()
+    client = OllamaClient("http://ollama.invalid")
+
+    class FakeResp:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def iter_lines(self):
+            yield '{"message": {"content": "{"}}'
+            cancel.set()  # user presses Cancel mid-stream
+            yield '{"message": {"content": "\\"headline\\""}}'
+
+    client._http.stream = lambda *a, **k: FakeResp()
+    with pytest.raises(Cancelled):
+        client.chat("m", "s", "p", fmt=None, output_tokens=10, cancel=cancel)
 
 
 def test_day_summary_input_includes_every_entry():
@@ -370,7 +427,7 @@ def test_day_summary_input_includes_every_entry():
     class Capture(Provider):
         name, model = "x", "y"
 
-        def summarize(self, text, entry_date, about_me="", system=None):
+        def summarize(self, text, entry_date, about_me="", system=None, cancel=None):
             seen.update(text=text, system=system)
             return {}
 

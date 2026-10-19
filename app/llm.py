@@ -16,20 +16,31 @@ class ProviderError(RuntimeError):
     """A provider failed in a way worth showing to the user."""
 
 
+class Cancelled(Exception):
+    """The user cancelled a summary while it was being written."""
+
+
+def _check(cancel) -> None:
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+
 class Provider:
     name: str
     model: str
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM,
+                  cancel=None) -> dict:
+        """`cancel` is an optional threading.Event; when set, stop and raise Cancelled."""
         raise NotImplementedError
 
-    def summarize_day(self, entries: list[dict], entry_date: str, about_me: str = "") -> dict:
+    def summarize_day(self, entries: list[dict], entry_date: str, about_me: str = "", cancel=None) -> dict:
         """One end-of-day summary from all of a day's entries (oldest first)."""
         parts = []
         for i, entry in enumerate(entries, 1):
             time = entry["created_at"][11:16]
             parts.append(f"<entry number=\"{i}\" recorded_at=\"{time} UTC\">\n{entry['text'].strip()}\n</entry>")
-        return self.summarize("\n\n".join(parts), entry_date, about_me, system=DAY_SYSTEM)
+        return self.summarize("\n\n".join(parts), entry_date, about_me, system=DAY_SYSTEM, cancel=cancel)
 
     def write(self, system: str, prompt: str) -> str:
         raise NotImplementedError
@@ -119,9 +130,17 @@ class ClaudeProvider(Provider):
         except anthropic.APIConnectionError as exc:
             raise ProviderError("Couldn't reach the Claude API.") from exc
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM,
+                  cancel=None) -> dict:
+        # Streamed so a cancel can stop it part-way.
+        def run(**kwargs):
+            with self._client.beta.messages.stream(**kwargs) as stream:
+                for _event in stream:
+                    _check(cancel)
+                return stream.get_final_message()
+
         response = self._call(
-            self._client.beta.messages.create,
+            run,
             model=self.model,
             max_tokens=16000,
             system=system,
@@ -169,15 +188,6 @@ class OllamaClient:
         self.url = url.rstrip("/")
         self._http = httpx.Client(base_url=self.url, timeout=httpx.Timeout(900, connect=5))
 
-    def _post(self, path: str, body: dict) -> httpx.Response:
-        try:
-            return self._http.post(path, json=body)
-        except httpx.ConnectError as exc:
-            raise ProviderError(
-                f"Couldn't reach Ollama at {self.url}. Is the Ollama app running on your Mac?") from exc
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"Ollama request failed: {exc}") from exc
-
     def models(self) -> list[dict]:
         try:
             resp = self._http.get("/api/tags", timeout=5)
@@ -186,10 +196,12 @@ class OllamaClient:
             raise ProviderError(f"Couldn't reach Ollama at {self.url}: {exc}") from exc
         return [{"name": m["name"], "size": m.get("size", 0)} for m in resp.json().get("models", [])]
 
-    def chat(self, model: str, system: str, prompt: str, fmt: dict | None, output_tokens: int) -> str:
+    def chat(self, model: str, system: str, prompt: str, fmt: dict | None, output_tokens: int,
+             cancel=None) -> str:
         body = {
             "model": model,
-            "stream": False,
+            # Streamed so a cancel can stop it: closing the connection makes Ollama stop generating.
+            "stream": True,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             "options": {"temperature": 0.2, "num_ctx": _context_size(system, prompt, output_tokens=output_tokens)},
             # Reasoning models (qwen3, deepseek-r1...) are much slower with thinking on
@@ -199,15 +211,45 @@ class OllamaClient:
         }
         if fmt:
             body["format"] = fmt
-        resp = self._post("/api/chat", body)
-        if resp.status_code == 400 and "think" in resp.text.lower():
+        try:
+            return self._stream_chat(body, cancel)
+        except _NoThink:
             body.pop("think")  # model doesn't support the think switch
-            resp = self._post("/api/chat", body)
-        if resp.status_code == 404:
-            raise ProviderError(f"Ollama doesn't have the model '{model}' yet. Download it in Settings.")
-        if resp.status_code >= 400:
-            raise ProviderError(f"Ollama error {resp.status_code}: {resp.text[:300]}")
-        return resp.json()["message"]["content"]
+            return self._stream_chat(body, cancel)
+
+    def _stream_chat(self, body: dict, cancel) -> str:
+        parts = []
+        try:
+            with self._http.stream("POST", "/api/chat", json=body) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    if resp.status_code == 400 and "think" in resp.text.lower() and "think" in body:
+                        raise _NoThink()
+                    if resp.status_code == 404:
+                        raise ProviderError(
+                            f"Ollama doesn't have the model '{body['model']}' yet. Download it in Settings.")
+                    raise ProviderError(f"Ollama error {resp.status_code}: {resp.text[:300]}")
+                for line in resp.iter_lines():
+                    _check(cancel)
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event.get("error"):
+                        raise ProviderError(f"Ollama error: {event['error']}")
+                    parts.append((event.get("message") or {}).get("content", ""))
+                    if event.get("done"):
+                        break
+        except httpx.ConnectError as exc:
+            raise ProviderError(
+                f"Couldn't reach Ollama at {self.url}. Is the Ollama app running on your Mac?") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Ollama request failed: {exc}") from exc
+        _check(cancel)
+        return "".join(parts)
+
+
+class _NoThink(Exception):
+    pass
 
 
 class OllamaProvider(Provider):
@@ -217,10 +259,11 @@ class OllamaProvider(Provider):
         self.model = model
         self.client = OllamaClient(url)
 
-    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM) -> dict:
+    def summarize(self, text: str, entry_date: str, about_me: str = "", system: str = SUMMARY_SYSTEM,
+                  cancel=None) -> dict:
         system = system + "\n\nRespond with a single JSON object matching the schema."
         raw = self.client.chat(self.model, system, _summary_prompt(text, entry_date, about_me),
-                               fmt=SUMMARY_SCHEMA, output_tokens=2048)
+                               fmt=SUMMARY_SCHEMA, output_tokens=2048, cancel=cancel)
         try:
             return normalize_summary(json.loads(raw))
         except json.JSONDecodeError as exc:

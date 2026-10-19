@@ -16,7 +16,7 @@ from .auth import COOKIE_NAME, PinAuth
 from .config import Settings, load_settings
 from .crypto import Box
 from .db import Store
-from .jobs import AudioStore, Worker
+from .jobs import AudioStore, Worker, day_entries
 from .llm import (ModelDownloads, OllamaClient, Provider, ProviderError, about_me, build_providers,
                   normalize_summary)
 from .prompts import REPORT_STYLES
@@ -415,7 +415,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         if not entry:
             raise HTTPException(404, "Entry not found")
         for day in {before["date"], entry["date"]}:
-            worker.enqueue_day(day)
+            worker.check_day(day)
         return entry
 
     @app.post("/api/entries/{entry_id}/summarize", dependencies=[Depends(require_login)])
@@ -428,6 +428,16 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         if not entry["text"].strip():
             raise HTTPException(400, "This entry has no text to summarise.")
         return queue_summary(entry_id, body.provider)
+
+    @app.post("/api/entries/{entry_id}/cancel", dependencies=[Depends(require_login)])
+    def cancel_entry(entry_id: int):
+        entry = store.get_entry(entry_id)
+        if not entry:
+            raise HTTPException(404, "Entry not found")
+        if entry["status"] != "summarising":
+            raise HTTPException(409, "Only a summary that's being written can be cancelled.")
+        worker.cancel("entry", entry_id)
+        return {"ok": True}
 
     @app.post("/api/entries/{entry_id}/retry", dependencies=[Depends(require_login)])
     def retry_entry(entry_id: int):
@@ -448,13 +458,16 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         if not entry or not store.delete_entry(entry_id):
             raise HTTPException(404, "Entry not found")
         audio_store.delete(entry_id)
-        worker.enqueue_day(entry["date"])
+        worker.check_day(entry["date"])
         return {"ok": True}
 
     # ---- end-of-day summaries --------------------------------------------
 
     def _day_out(day: dict) -> dict:
-        return {k: v for k, v in day.items() if k != "fingerprint"}
+        out = {k: v for k, v in day.items() if k != "fingerprint"}
+        # Stale = entries were added, edited or removed since it was written.
+        out["stale"] = day["status"] == "done" and day_entries(store, day["date"])[1] != day["fingerprint"]
+        return out
 
     @app.get("/api/days", dependencies=[Depends(require_login)])
     def list_days(start: str | None = None, end: str | None = None):
@@ -467,13 +480,27 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             raise HTTPException(404, "No end-of-day summary for that date")
         return _day_out(day)
 
-    @app.post("/api/days/{entry_date}/refresh", dependencies=[Depends(require_login)])
-    def refresh_day(entry_date: str):
-        if not store.get_day(entry_date):
-            raise HTTPException(404, "No end-of-day summary for that date")
-        store.save_day(entry_date, status="summarising")
-        worker.enqueue_day(entry_date, force=True)
+    @app.post("/api/days/{entry_date}/generate", dependencies=[Depends(require_login)])
+    def generate_day(entry_date: str):
+        """Build (or rebuild) the end-of-day summary. Only runs when you ask for it."""
+        try:
+            _check_date(entry_date)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        entries, _ = day_entries(store, entry_date)
+        if len(entries) < 2:
+            raise HTTPException(400, "An end-of-day summary needs at least two finished entries.")
+        store.save_day(entry_date, status="summarising", error=None, entry_count=len(entries))
+        worker.enqueue_day(entry_date)
         return _day_out(store.get_day(entry_date))
+
+    @app.post("/api/days/{entry_date}/cancel", dependencies=[Depends(require_login)])
+    def cancel_day(entry_date: str):
+        day = store.get_day(entry_date)
+        if not day or day["status"] != "summarising":
+            raise HTTPException(409, "That end-of-day summary isn't running.")
+        worker.cancel("day", entry_date)
+        return {"ok": True}
 
     # ---- reports ---------------------------------------------------------
 

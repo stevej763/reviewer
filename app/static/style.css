@@ -275,3 +275,4 @@ details pre { white-space: pre-wrap; font: inherit; font-size: .92rem; margin: .
 /* End-of-day card */
 .day-summary { border-color: var(--accent); background: linear-gradient(var(--accent-soft), var(--surface) 140px); }
 .day-label { font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .05em; font-size: .8rem; }
+.processing .btn { margin-left: auto; flex: none; }

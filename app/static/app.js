@@ -262,30 +262,65 @@ function summaryParts(s) {
   return parts;
 }
 
-// The end-of-day summary combining all of a day's entries (only exists for 2+ entries).
-function renderDay(day) {
-  const card = el("article", { class: "card entry day-summary", "data-day": day.date, "data-status": day.status });
-  const busyNow = day.status === "summarising";
+// The end-of-day summary combining all of a day's entries. It's only written when you ask.
+// `day` is the stored summary, or null when there isn't one yet (then a "create" card is shown).
+function renderDay(day, date, entryCount) {
+  date = day ? day.date : date;
+  const card = el("article", { class: "card entry day-summary", "data-day": date,
+    "data-status": day ? day.status : "none" });
+  const busyNow = day && day.status === "summarising";
+  const count = day && !day.stale ? day.entry_count : entryCount ?? day?.entry_count;
   card.append(el("div", { class: "entry-head" },
     el("span", { class: "day-label" }, "End of day"),
-    el("span", { class: "entry-meta" }, `${prettyDate(day.date)} · ${day.entry_count} entries`)));
+    el("span", { class: "entry-meta" }, `${prettyDate(date)} · ${count} entries`)));
+
+  const generate = (label, primary) => el("button", {
+    class: primary ? "btn primary" : "btn",
+    onclick: async (e) => {
+      await busy(e.currentTarget, "Starting…", async () => {
+        try { card.replaceWith(renderDay(await api(`/api/days/${date}/generate`, { method: "POST" }))); }
+        catch (err) { toast(err.message); }
+      });
+    },
+  }, label);
+
+  if (!day) {
+    card.append(el("p", { class: "muted small" }, "Combine this day's entries into one end-of-day summary."));
+    card.append(el("div", { class: "entry-actions" }, generate("Create end-of-day summary", true)));
+    return card;
+  }
   if (busyNow) {
     card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
-      el("b", {}, day.summary ? "Updating with your latest entry…" : "Combining today's entries…")));
+      el("b", {}, day.summary ? "Updating the end-of-day summary…" : "Combining this day's entries…"),
+      el("button", {
+        class: "btn small",
+        onclick: async (e) => {
+          await busy(e.currentTarget, "Cancelling…", async () => {
+            try { await api(`/api/days/${date}/cancel`, { method: "POST" }); watchPending(); }
+            catch (err) { toast(err.message); }
+          });
+        },
+      }, "Cancel")));
     watchPending();
   }
   if (day.status === "failed") card.append(el("div", { class: "warn" }, day.error || "Couldn't build the end-of-day summary."));
+  if (day.stale) {
+    card.append(el("div", { class: "warn" }, "Entries have changed since this was written."));
+  }
   if (day.summary) card.append(...summaryParts(day.summary));
   if (!busyNow) {
-    card.append(el("div", { class: "entry-actions" }, el("button", {
-      class: "btn",
-      onclick: async () => {
-        try { card.replaceWith(renderDay(await api(`/api/days/${day.date}/refresh`, { method: "POST" }))); }
-        catch (err) { toast(err.message); }
-      },
-    }, "Rebuild")));
+    card.append(el("div", { class: "entry-actions" },
+      day.status === "failed" ? generate("Try again", true) : day.stale ? generate("Update summary", true) : generate("Rebuild")));
   }
   return card;
+}
+
+// The day card for a date: the stored summary, a "create" card, or nothing (fewer than 2 entries).
+function dayCardFor(date, days, entries) {
+  const done = entries.filter((e) => e.date === date && e.status === "done").length;
+  const summary = days.find((d) => d.date === date);
+  if (summary) return renderDay(summary, date, done);
+  return done >= 2 ? renderDay(null, date, done) : null;
 }
 
 async function fetchDays(start, end) {
@@ -302,9 +337,19 @@ function renderSummary(entry, { onChange } = {}) {
     el("span", { class: "entry-meta" }, meta)));
 
   if (PENDING[entry.status]) {
+    const cancel = entry.status === "summarising" ? el("button", {
+      class: "btn small",
+      onclick: async (e) => {
+        await busy(e.currentTarget, "Cancelling…", async () => {
+          try { await api(`/api/entries/${entry.id}/cancel`, { method: "POST" }); watchPending(); }
+          catch (err) { toast(err.message); }
+        });
+      },
+    }, "Cancel") : null;
     card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
       el("div", {}, el("b", {}, PENDING[entry.status]),
-        el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background."))));
+        el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background.")),
+      cancel));
     watchPending();
   }
   if (entry.status === "failed") {
@@ -378,7 +423,13 @@ function watchPending() {
         try {
           const day = await api(`/api/days/${card.dataset.day}`);
           if (day.status !== card.dataset.status) card.replaceWith(renderDay(day));
-        } catch { card.remove(); /* day no longer has a combined summary */ }
+        } catch {
+          // Cancelled before it was ever written: back to the "create" card.
+          const date = card.dataset.day;
+          const entries = await api(`/api/entries?start=${date}&end=${date}`).catch(() => []);
+          const fresh = dayCardFor(date, [], entries);
+          fresh ? card.replaceWith(fresh) : card.remove();
+        }
         continue;
       }
       try {
@@ -454,7 +505,8 @@ async function loadLatest() {
   const day = $("#entry-date").value || today();
   try {
     const [entries, days] = await Promise.all([api(`/api/entries?start=${day}&end=${day}`), fetchDays(day, day)]);
-    $("#latest").replaceChildren(...days.map(renderDay), ...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
+    const dayCard = dayCardFor(day, days, entries);
+    $("#latest").replaceChildren(...(dayCard ? [dayCard] : []), ...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
   } catch { /* shown elsewhere */ }
 }
 
@@ -466,17 +518,15 @@ function addToLatest(card) {
 }
 
 // Shows, updates or removes the selected day's end-of-day card on the Log view.
-async function refreshDayCard(retry = true) {
+async function refreshDayCard() {
   const day = $("#entry-date").value || today();
-  const [summary] = await fetchDays(day, day);
-  const existing = $("#latest .day-summary");
-  if (summary) {
-    const card = renderDay(summary);
-    existing ? existing.replaceWith(card) : $("#latest").prepend(card);
-  } else if (existing) existing.remove();
-  // If it isn't there yet the worker may not have started on it; look once more shortly.
-  // (While it's being built, the card's own polling takes over.)
-  if (!summary && retry) setTimeout(() => { if (!$("#view-log").hidden) refreshDayCard(false); }, 4000);
+  try {
+    const [entries, days] = await Promise.all([api(`/api/entries?start=${day}&end=${day}`), fetchDays(day, day)]);
+    const card = dayCardFor(day, days, entries);
+    const existing = $("#latest .day-summary");
+    if (card) existing ? existing.replaceWith(card) : $("#latest").prepend(card);
+    else if (existing) existing.remove();
+  } catch { /* try again on the next change */ }
 }
 $("#entry-date").addEventListener("change", loadLatest);
 
@@ -495,12 +545,14 @@ async function loadHistory() {
     $("#hist-count").textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
     const dates = entries.map((e) => e.date);
     const days = entries.length ? await fetchDays(dates[dates.length - 1], dates[0]) : [];
-    const byDate = Object.fromEntries(days.map((d) => [d.date, d]));
     // Each day with several entries starts with its end-of-day card.
     const cards = [];
     let lastDate = null;
     for (const e of entries) {
-      if (e.date !== lastDate && byDate[e.date]) cards.push(renderDay(byDate[e.date]));
+      if (e.date !== lastDate) {
+        const dayCard = dayCardFor(e.date, days, entries);
+        if (dayCard) cards.push(dayCard);
+      }
       lastDate = e.date;
       cards.push(renderSummary(e, { onChange: loadHistory }));
     }
