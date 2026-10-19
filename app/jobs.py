@@ -82,6 +82,7 @@ class Worker:
         self._cancelled: set[tuple[str, int | str]] = set()
         self._current: tuple[str, int | str] | None = None
         self._cancel_event = threading.Event()
+        self._progress: dict[int, float] = {}  # entry id -> transcription progress (in memory only)
 
     def start(self) -> None:
         for entry_id in self._store.pending_entry_ids():
@@ -104,6 +105,10 @@ class Worker:
                 return
             self._queued_days.add(entry_date)
         self._queue.put(("day", entry_date))
+
+    def progress(self, entry_id: int) -> float | None:
+        """How far through transcription a recording is, or None if it isn't being transcribed now."""
+        return self._progress.get(entry_id)
 
     def cancel(self, kind: str, key) -> None:
         with self._lock:
@@ -191,12 +196,15 @@ class Worker:
             if audio is None:
                 self._store.set_status(entry_id, "failed", "The recording is missing, so it can't be transcribed.")
                 return
+            self._progress[entry_id] = 0.0
             try:
-                text = self._transcribe(*audio)
+                text = self._transcribe(*audio, on_progress=lambda f: self._progress.__setitem__(entry_id, f))
             except Exception as exc:
                 log.exception("transcription failed")
                 self._store.set_status(entry_id, "failed", f"Transcription failed: {exc}")
                 return
+            finally:
+                self._progress.pop(entry_id, None)
             if not text.strip():
                 self._store.set_status(entry_id, "failed", "No speech was picked up in that recording.")
                 return

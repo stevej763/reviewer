@@ -345,9 +345,9 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     audio_store = AudioStore(settings.data_dir / "pending-audio", box)
     worker = Worker(
         store, audio_store,
-        transcribe=lambda data, suffix: transcriber.transcribe(
+        transcribe=lambda data, suffix, on_progress=None: transcriber.transcribe(
             data, suffix=suffix, language=config.get()["speech"]["language"],
-            model_name=config.get()["speech"]["model"]),
+            model_name=config.get()["speech"]["model"], on_progress=on_progress),
         pick_provider=pick_provider,
         about_me=me,
     )
@@ -388,9 +388,14 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     # ---- entries ---------------------------------------------------------
 
+    def with_progress(entry: dict) -> dict:
+        if entry["status"] == "transcribing":
+            entry["progress"] = worker.progress(entry["id"])  # None = waiting its turn / loading model
+        return entry
+
     @app.get("/api/entries", dependencies=[Depends(require_login)])
     def list_entries(start: str | None = None, end: str | None = None, limit: int | None = None):
-        return store.list_entries(start, end, limit)
+        return [with_progress(e) for e in store.list_entries(start, end, limit)]
 
     @app.post("/api/entries", status_code=202, dependencies=[Depends(require_login)])
     def create_entry(body: EntryIn):
@@ -403,7 +408,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         entry = store.get_entry(entry_id)
         if not entry:
             raise HTTPException(404, "Entry not found")
-        return entry
+        return with_progress(entry)
 
     @app.put("/api/entries/{entry_id}", dependencies=[Depends(require_login)])
     def update_entry(entry_id: int, body: EntryUpdate):

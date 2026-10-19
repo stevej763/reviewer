@@ -35,7 +35,7 @@ class FakeProvider(Provider):
 
 
 class FakeTranscriber:
-    def transcribe(self, audio, suffix=".webm", language=None, model_name=None):
+    def transcribe(self, audio, suffix=".webm", language=None, model_name=None, on_progress=None):
         return f"heard {len(audio)} bytes as {suffix} in {language}"
 
 
@@ -296,7 +296,7 @@ def test_failed_transcription_can_be_retried(make_client):
     class Flaky(FakeTranscriber):
         calls = 0
 
-        def transcribe(self, audio, suffix=".webm", language=None, model_name=None):
+        def transcribe(self, audio, suffix=".webm", language=None, model_name=None, on_progress=None):
             Flaky.calls += 1
             if Flaky.calls == 1:
                 raise RuntimeError("decoder crashed")
@@ -468,3 +468,26 @@ def test_speech_model_setting(client):
     r = client.put("/api/settings", json={"speech": {"language": "en", "model": "large-v3-turbo"}})
     assert r.json()["speech"]["model"] == "large-v3-turbo"
     assert client.put("/api/settings", json={"speech": {"language": "en", "model": "nope"}}).status_code == 422
+
+
+
+def test_transcription_progress_is_reported(make_client):
+    seen = []
+
+    class Slow(FakeTranscriber):
+        def transcribe(self, audio, suffix=".webm", language=None, model_name=None, on_progress=None):
+            for f in (0.25, 0.5, 1.0):
+                on_progress(f)
+                seen.append(c.get(f"/api/entries/{eid}").json()["progress"])
+            return "done talking"
+
+    c, settings = make_client()
+    app = create_app(settings, providers={"claude": FakeProvider()}, transcriber=Slow(), background=False)
+    c = TestClient(app)
+    c.post("/api/login", json={"pin": PIN})
+    eid = c.post("/api/recordings", data={"date": "2026-10-19"},
+                 files={"audio": ("r.webm", b"abc", "audio/webm")}).json()["id"]
+    assert c.get(f"/api/entries/{eid}").json()["progress"] is None  # queued
+    app.state.worker.drain()
+    assert seen == [0.25, 0.5, 1.0]
+    assert "progress" not in c.get(f"/api/entries/{eid}").json()

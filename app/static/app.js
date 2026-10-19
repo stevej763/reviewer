@@ -346,8 +346,9 @@ function renderSummary(entry, { onChange } = {}) {
         });
       },
     }, "Cancel") : null;
+    const bar = entry.status === "transcribing" ? progressBar(entry.progress) : null;
     card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
-      el("div", {}, el("b", {}, PENDING[entry.status]),
+      el("div", { class: "processing-body" }, el("b", {}, PENDING[entry.status]), bar,
         el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background.")),
       cancel));
     watchPending();
@@ -408,6 +409,28 @@ function renderSummary(entry, { onChange } = {}) {
   return card;
 }
 
+// Transcription progress: how far through the recording Whisper has got.
+function progressBar(fraction) {
+  const fill = el("div");
+  const label = el("span", { class: "muted small progress-label" });
+  const wrap = el("div", { class: "progress-row" }, el("div", { class: "progress" }, fill), label);
+  setProgress(wrap, fraction);
+  return wrap;
+}
+
+function setProgress(wrap, fraction) {
+  const fill = wrap.querySelector(".progress > div");
+  const label = wrap.querySelector(".progress-label");
+  if (fraction == null) {
+    fill.style.width = "0%";
+    label.textContent = "Waiting to start…";
+  } else {
+    const pct = Math.round(fraction * 100);
+    fill.style.width = `${Math.max(pct, 2)}%`;
+    label.textContent = `${pct}%`;
+  }
+}
+
 // While any entry on screen is still processing, check on it every few seconds
 // and swap in the finished card.
 let pendingTimer = null;
@@ -434,6 +457,8 @@ function watchPending() {
       }
       try {
         const entry = await api(`/api/entries/${card.dataset.entryId}`);
+        const bar = card.querySelector(".progress-row");
+        if (entry.status === card.dataset.status && bar) setProgress(bar, entry.progress);
         if (entry.status !== card.dataset.status) {
           card.replaceWith(renderSummary(entry, card._opts));
           entryFinished = true;
@@ -445,7 +470,7 @@ function watchPending() {
     // A finished entry may start (or update) the day's combined summary.
     if (entryFinished && !$("#view-log").hidden) await refreshDayCard();
     if (document.querySelector('.entry[data-status="transcribing"], .entry[data-status="summarising"]')) watchPending();
-  }, 3000);
+  }, 2000);
 }
 
 function editEntry(entry, card, onChange) {
