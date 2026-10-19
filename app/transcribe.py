@@ -6,30 +6,45 @@ import threading
 from .config import Settings
 
 
+# Speech models offered in Settings, smallest first. Download sizes are approximate.
+MODELS = {
+    "base": "Fastest, least accurate (~150 MB)",
+    "small": "Good balance; the default (~500 MB)",
+    "medium": "More accurate, about 2-3x slower than small (~1.5 GB)",
+    "large-v3-turbo": "Most accurate for its speed; recommended for accuracy (~1.6 GB)",
+    "large-v3": "Most accurate, slowest; needs plenty of memory (~3 GB)",
+}
+
+
 class Transcriber:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._model = None
+        self._model_name = None
         self._lock = threading.Lock()
 
-    def _load(self):
+    def _load(self, name: str | None = None):
+        name = name or self._settings.whisper_model
         with self._lock:
-            if self._model is None:
+            if self._model is None or self._model_name != name:
                 from faster_whisper import WhisperModel
 
+                self._model = None  # free the old model before loading a bigger one
                 self._model = WhisperModel(
-                    self._settings.whisper_model,
+                    name,
                     device="cpu",
                     compute_type=self._settings.whisper_compute_type,
                     download_root=str(self._settings.data_dir / "whisper-models"),
                 )
+                self._model_name = name
         return self._model
 
-    def warm_up(self):
-        self._load()
+    def warm_up(self, name: str | None = None):
+        self._load(name)
 
-    def transcribe(self, audio: bytes, suffix: str = ".webm", language: str | None = None) -> str:
-        model = self._load()
+    def transcribe(self, audio: bytes, suffix: str = ".webm", language: str | None = None,
+                   model_name: str | None = None) -> str:
+        model = self._load(model_name)
         # PyAV (bundled with faster-whisper) decodes webm/opus from Chrome and mp4/aac from Safari.
         with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
             tmp.write(audio)

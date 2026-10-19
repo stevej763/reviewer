@@ -35,7 +35,7 @@ class FakeProvider(Provider):
 
 
 class FakeTranscriber:
-    def transcribe(self, audio, suffix=".webm", language=None):
+    def transcribe(self, audio, suffix=".webm", language=None, model_name=None):
         return f"heard {len(audio)} bytes as {suffix} in {language}"
 
 
@@ -296,7 +296,7 @@ def test_failed_transcription_can_be_retried(make_client):
     class Flaky(FakeTranscriber):
         calls = 0
 
-        def transcribe(self, audio, suffix=".webm", language=None):
+        def transcribe(self, audio, suffix=".webm", language=None, model_name=None):
             Flaky.calls += 1
             if Flaky.calls == 1:
                 raise RuntimeError("decoder crashed")
@@ -402,3 +402,12 @@ def test_long_ranges_use_summaries_only(make_client):
     c.post("/api/entries", json={"date": "2026-10-01", "text": "raw words here"})
     c.post("/api/reports", json={"start": "2026-09-01", "end": "2026-10-31"})
     assert "What I said" not in fake.prompts[-1]
+
+
+
+def test_speech_model_setting(client):
+    assert "large-v3-turbo" in client.get("/api/session").json()["speech_models"]
+    assert client.get("/api/settings").json()["speech"]["model"] == "small"
+    r = client.put("/api/settings", json={"speech": {"language": "en", "model": "large-v3-turbo"}})
+    assert r.json()["speech"]["model"] == "large-v3-turbo"
+    assert client.put("/api/settings", json={"speech": {"language": "en", "model": "nope"}}).status_code == 422

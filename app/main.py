@@ -20,6 +20,7 @@ from .jobs import AudioStore, Worker
 from .llm import (ModelDownloads, OllamaClient, Provider, ProviderError, about_me, build_providers,
                   normalize_summary)
 from .prompts import REPORT_STYLES
+from .transcribe import MODELS as SPEECH_MODELS
 from .transcribe import Transcriber
 
 log = logging.getLogger("reviewer")
@@ -80,6 +81,14 @@ class AiIn(BaseModel):
 
 class SpeechIn(BaseModel):
     language: str = Field(default="en", max_length=10)
+    model: str = "small"
+
+    @field_validator("model")
+    @classmethod
+    def _model(cls, v):
+        if v not in SPEECH_MODELS:
+            raise ValueError(f"speech model must be one of {', '.join(SPEECH_MODELS)}")
+        return v
 
 
 class SetupIn(BaseModel):
@@ -246,6 +255,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             "authenticated": authenticated,
             "locked_for": auth.locked_for(),
             "report_styles": {k: v["label"] for k, v in REPORT_STYLES.items()},
+            "speech_models": SPEECH_MODELS,
         }
         if not setup_done:
             info["defaults"] = config.public()  # pre-fills the setup screen
@@ -336,7 +346,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     worker = Worker(
         store, audio_store,
         transcribe=lambda data, suffix: transcriber.transcribe(
-            data, suffix=suffix, language=config.get()["speech"]["language"]),
+            data, suffix=suffix, language=config.get()["speech"]["language"],
+            model_name=config.get()["speech"]["model"]),
         pick_provider=pick_provider,
         about_me=me,
     )

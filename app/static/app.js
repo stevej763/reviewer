@@ -98,6 +98,7 @@ async function refreshSession() {
   state.providers = s.providers || [];
   state.defaultProvider = s.default_provider;
   state.styles = s.report_styles;
+  state.speechModels = s.speech_models || {};
   fillProviders($("#entry-provider"));
   fillProviders($("#rep-provider"));
   $("#log-error").textContent = s.authenticated && !state.providers.length
@@ -663,6 +664,8 @@ function settingsForm(cfg, { setup = false, onSaved, parts = ["profile", "ai", "
       placeholder: ai.anthropic_key_set ? `Saved (${ai.anthropic_key_hint || "hidden"}). Leave blank to keep` : "sk-ant-… (optional)" }),
     claudeModel: input({}, ai.anthropic_model),
     language: el("select", {}, LANGUAGES.map(([v, l]) => el("option", { value: v, selected: v === cfg.speech.language }, l))),
+    speechModel: el("select", {}, Object.entries(state.speechModels || {}).map(([v, l]) =>
+      el("option", { value: v, selected: v === cfg.speech.model }, `${v}: ${l}`))),
   };
 
   const providerRadio = (value, title, sub) => el("label", { class: "radio-card" },
@@ -785,7 +788,9 @@ function settingsForm(cfg, { setup = false, onSaved, parts = ["profile", "ai", "
     has("speech") ? el("section", { class: "card" },
       el("h2", {}, "Speech"),
       el("p", { class: "muted small" }, "Recordings are transcribed on this machine and deleted once transcribed."),
-      field("Language you speak in", f.language)) : null,
+      field("Language you speak in", f.language),
+      field("Speech model", f.speechModel,
+        "Bigger models are more accurate but slower. Recordings are processed in the background, so a slower model only means waiting a bit longer for highlights. A new model downloads the first time it's used.")) : null,
     el("div", { class: "actions" }, save),
     error);
 
@@ -809,7 +814,7 @@ function settingsForm(cfg, { setup = false, onSaved, parts = ["profile", "ai", "
         anthropic_model: f.claudeModel.value.trim(),
       };
     }
-    if (has("speech")) body.speech = { language: f.language.value };
+    if (has("speech")) body.speech = { language: f.language.value, model: f.speechModel.value || "small" };
     if (has("ai") && provider === "claude" && !body.ai.anthropic_api_key && !ai.anthropic_key_set) {
       error.textContent = "Add an Anthropic API key to use Claude, or pick the local model.";
       return;

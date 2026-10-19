@@ -8,6 +8,7 @@ import threading
 
 from .config import Settings
 from .db import Store
+from .transcribe import MODELS as SPEECH_MODELS
 
 KEY = "app"
 PROVIDERS = ("ollama", "claude")
@@ -49,7 +50,8 @@ class AppConfig:
                 "anthropic_api_key": s.anthropic_api_key,
                 "anthropic_model": s.anthropic_model,
             },
-            "speech": {"language": s.whisper_language},
+            "speech": {"language": s.whisper_language,
+                       "model": s.whisper_model if s.whisper_model in SPEECH_MODELS else "small"},
         }
 
     def get(self) -> dict:
