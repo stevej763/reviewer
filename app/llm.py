@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from datetime import date
 
 import anthropic
@@ -246,28 +247,45 @@ class ModelDownloads:
 
     def _run(self, url: str, model: str):
         layers: dict[str, tuple[int, int]] = {}
-        try:
-            with httpx.stream("POST", f"{url.rstrip('/')}/api/pull", json={"model": model, "stream": True},
-                              timeout=httpx.Timeout(None, connect=5)) as resp:
-                if resp.status_code >= 400:
-                    resp.read()
-                    raise ProviderError(f"Ollama error {resp.status_code}: {resp.text[:200]}")
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    if "error" in event:
-                        raise ProviderError(event["error"])
+        attempts = 0
+        while True:
+            try:
+                self._pull_once(url, model, layers)
+                with self._lock:
+                    self.state["status"] = "done"
+                return
+            except httpx.TransportError as exc:
+                # Big downloads sometimes drop mid-stream; Ollama resumes where it left off.
+                attempts += 1
+                if attempts <= 5:
                     with self._lock:
-                        # Progress arrives per layer; add the layers up for one overall bar.
-                        if event.get("digest") and event.get("total"):
-                            layers[event["digest"]] = (event.get("completed", 0), event["total"])
-                            self.state["completed"] = sum(c for c, _ in layers.values())
-                            self.state["total"] = sum(t for _, t in layers.values())
-                        self.state["detail"] = event.get("status", "")
-            with self._lock:
-                self.state["status"] = "done"
-        except Exception as exc:  # network errors, bad model names
+                        self.state["detail"] = "connection dropped, resuming"
+                    time.sleep(3)
+                    continue
+                error = f"Download kept failing: {exc}"
+            except Exception as exc:  # bad model names, Ollama errors
+                error = str(exc) or exc.__class__.__name__
             with self._lock:
                 self.state["status"] = "error"
-                self.state["error"] = str(exc) or exc.__class__.__name__
+                self.state["error"] = error
+            return
+
+    def _pull_once(self, url: str, model: str, layers: dict):
+        with httpx.stream("POST", f"{url.rstrip('/')}/api/pull", json={"model": model, "stream": True},
+                          timeout=httpx.Timeout(None, connect=5)) as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                raise ProviderError(f"Ollama error {resp.status_code}: {resp.text[:200]}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if "error" in event:
+                    raise ProviderError(event["error"])
+                with self._lock:
+                    # Progress arrives per layer; add the layers up for one overall bar.
+                    if event.get("digest") and event.get("total"):
+                        layers[event["digest"]] = (event.get("completed", 0), event["total"])
+                        self.state["completed"] = sum(c for c, _ in layers.values())
+                        self.state["total"] = sum(t for _, t in layers.values())
+                    self.state["detail"] = event.get("status", "")
