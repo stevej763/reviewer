@@ -5,7 +5,7 @@ import logging
 from datetime import date
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +16,7 @@ from .auth import COOKIE_NAME, PinAuth
 from .config import Settings, load_settings
 from .crypto import Box
 from .db import Store
+from .jobs import AudioStore, Worker
 from .llm import (ModelDownloads, OllamaClient, Provider, ProviderError, about_me, build_providers,
                   normalize_summary)
 from .prompts import REPORT_STYLES
@@ -160,8 +161,9 @@ class ReportIn(BaseModel):
 
 
 def create_app(settings: Settings | None = None, providers: dict[str, Provider] | None = None,
-               transcriber: Transcriber | None = None) -> FastAPI:
-    """`providers` overrides the configured AI providers (used by tests)."""
+               transcriber: Transcriber | None = None, background: bool = True) -> FastAPI:
+    """`providers` overrides the configured AI providers; `background=False` leaves queued
+    work for the caller to run with app.state.worker.drain() (both used by tests)."""
     settings = settings or load_settings()
     box = Box(settings.secret_key)
     store = Store(settings.db_path, box)
@@ -327,48 +329,62 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         response.delete_cookie(COOKIE_NAME, path="/")
         return {"ok": True}
 
+    # ---- background processing ------------------------------------------
+
+    audio_store = AudioStore(settings.data_dir / "pending-audio", box)
+    worker = Worker(
+        store, audio_store,
+        transcribe=lambda data, suffix: transcriber.transcribe(
+            data, suffix=suffix, language=config.get()["speech"]["language"]),
+        pick_provider=pick_provider,
+        about_me=me,
+    )
+    if background:
+        worker.start()
+
+    def queue_summary(entry_id: int, provider: str | None) -> dict:
+        store.set_status(entry_id, "summarising", wanted_provider=provider or "")
+        worker.enqueue(entry_id)
+        return store.get_entry(entry_id)
+
     # ---- speech ----------------------------------------------------------
 
-    @app.post("/api/transcribe", dependencies=[Depends(require_login)])
-    def transcribe(audio: UploadFile = File(...)):
+    @app.post("/api/recordings", status_code=202, dependencies=[Depends(require_login)])
+    def upload_recording(audio: UploadFile = File(...), date: str = Form(...), provider: str | None = Form(None)):
+        """Store a recording and return straight away; it's transcribed and summarised in the background."""
+        try:
+            _check_date(date)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         data = audio.file.read(MAX_AUDIO_BYTES + 1)
         if len(data) > MAX_AUDIO_BYTES:
             raise HTTPException(413, "Recording is too large.")
         if not data:
             raise HTTPException(400, "Empty recording.")
         content_type = (audio.content_type or "").lower()
-        suffix = ".mp4" if "mp4" in content_type or "m4a" in content_type or "aac" in content_type else ".webm"
-        if "ogg" in content_type:
+        suffix = ".webm"
+        if any(t in content_type for t in ("mp4", "m4a", "aac")):
+            suffix = ".mp4"
+        elif "ogg" in content_type:
             suffix = ".ogg"
-        if "wav" in content_type:
+        elif "wav" in content_type:
             suffix = ".wav"
-        try:
-            text = transcriber.transcribe(data, suffix=suffix, language=config.get()["speech"]["language"])
-        except Exception as exc:  # decoding / model errors
-            log.exception("transcription failed")
-            raise HTTPException(500, f"Transcription failed: {exc}") from exc
-        return {"text": text}
+        entry = store.add_entry(date, "", None, None, None, status="transcribing", wanted_provider=provider or "")
+        audio_store.save(entry["id"], data, suffix)
+        worker.enqueue(entry["id"])
+        return entry
 
     # ---- entries ---------------------------------------------------------
-
-    def _summarize(entry_id: int, text: str, entry_date: str, provider_name: str | None) -> dict:
-        provider = pick_provider(provider_name)
-        summary = provider.summarize(text, entry_date, me())
-        return store.update_entry(entry_id, summary=summary, provider=provider.name, model=provider.model)
 
     @app.get("/api/entries", dependencies=[Depends(require_login)])
     def list_entries(start: str | None = None, end: str | None = None, limit: int | None = None):
         return store.list_entries(start, end, limit)
 
-    @app.post("/api/entries", dependencies=[Depends(require_login)])
+    @app.post("/api/entries", status_code=202, dependencies=[Depends(require_login)])
     def create_entry(body: EntryIn):
-        # Save the raw text first so a failed summary never loses the brain dump.
+        # Saved first, summarised in the background, so the brain dump is never lost.
         entry = store.add_entry(body.date, body.text.strip(), None, None, None)
-        try:
-            return _summarize(entry["id"], entry["text"], entry["date"], body.provider)
-        except (ProviderError, HTTPException) as exc:
-            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            return {**entry, "summary_error": detail}
+        return queue_summary(entry["id"], body.provider)
 
     @app.get("/api/entries/{entry_id}", dependencies=[Depends(require_login)])
     def get_entry(entry_id: int):
@@ -392,12 +408,30 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         entry = store.get_entry(entry_id)
         if not entry:
             raise HTTPException(404, "Entry not found")
-        return _summarize(entry_id, entry["text"], entry["date"], body.provider)
+        if entry["status"] in ("transcribing", "summarising"):
+            raise HTTPException(409, "This entry is still being processed.")
+        if not entry["text"].strip():
+            raise HTTPException(400, "This entry has no text to summarise.")
+        return queue_summary(entry_id, body.provider)
+
+    @app.post("/api/entries/{entry_id}/retry", dependencies=[Depends(require_login)])
+    def retry_entry(entry_id: int):
+        entry = store.get_entry(entry_id)
+        if not entry:
+            raise HTTPException(404, "Entry not found")
+        if entry["status"] != "failed":
+            raise HTTPException(409, "Only failed entries can be retried.")
+        if audio_store.exists(entry_id):
+            store.set_status(entry_id, "transcribing")
+            worker.enqueue(entry_id)
+            return store.get_entry(entry_id)
+        return queue_summary(entry_id, entry["wanted_provider"])
 
     @app.delete("/api/entries/{entry_id}", dependencies=[Depends(require_login)])
     def delete_entry(entry_id: int):
         if not store.delete_entry(entry_id):
             raise HTTPException(404, "Entry not found")
+        audio_store.delete(entry_id)
         return {"ok": True}
 
     # ---- reports ---------------------------------------------------------
@@ -406,7 +440,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     def create_report(body: ReportIn):
         if body.start > body.end:
             raise HTTPException(400, "Start date is after end date.")
-        entries = store.list_entries(body.start, body.end)
+        # Skip recordings that haven't been transcribed yet.
+        entries = [e for e in store.list_entries(body.start, body.end) if e["text"].strip()]
         if not entries:
             raise HTTPException(400, "No log entries in that date range.")
         provider = pick_provider(body.provider)
@@ -474,6 +509,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     app.state.store = store
     app.state.config = config
+    app.state.worker = worker
     app.state.transcriber = transcriber
     return app
 

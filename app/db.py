@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS entries (
     raw_text BLOB NOT NULL,
     summary BLOB,
     provider TEXT,
-    model TEXT
+    model TEXT,
+    status TEXT NOT NULL DEFAULT 'done',
+    error TEXT,
+    wanted_provider TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(entry_date);
 
@@ -50,6 +53,12 @@ class Store:
         self.box = box
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # Columns added after the first release
+            existing = {r["name"] for r in conn.execute("PRAGMA table_info(entries)")}
+            for column, ddl in (("status", "TEXT NOT NULL DEFAULT 'done'"), ("error", "TEXT"),
+                                ("wanted_provider", "TEXT")):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE entries ADD COLUMN {column} {ddl}")
         path.chmod(0o600)
 
     @contextmanager
@@ -88,16 +97,20 @@ class Store:
             "summary": json.loads(self.box.open(row["summary"])) if row["summary"] else None,
             "provider": row["provider"],
             "model": row["model"],
+            "status": row["status"],
+            "error": row["error"],
+            "wanted_provider": row["wanted_provider"],
         }
 
-    def add_entry(self, entry_date: str, text: str, summary: dict | None, provider: str | None, model: str | None) -> dict:
+    def add_entry(self, entry_date: str, text: str, summary: dict | None, provider: str | None, model: str | None,
+                  status: str = "done", wanted_provider: str | None = None) -> dict:
         now = _now()
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO entries (entry_date, created_at, updated_at, raw_text, summary, provider, model) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO entries (entry_date, created_at, updated_at, raw_text, summary, provider, model, "
+                "status, wanted_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (entry_date, now, now, self.box.seal(text),
-                 self.box.seal(json.dumps(summary)) if summary else None, provider, model),
+                 self.box.seal(json.dumps(summary)) if summary else None, provider, model, status, wanted_provider),
             )
             entry_id = cur.lastrowid
         return self.get_entry(entry_id)
@@ -122,6 +135,19 @@ class Store:
                 ),
             )
         return self.get_entry(entry_id)
+
+    def set_status(self, entry_id: int, status: str, error: str | None = None,
+                   wanted_provider: str | None = None) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE entries SET status=?, error=?, wanted_provider=COALESCE(?, wanted_provider) WHERE id=?",
+                (status, error, wanted_provider, entry_id))
+
+    def pending_entry_ids(self) -> list[int]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT id FROM entries WHERE status IN ('transcribing', 'summarising') "
+                                "ORDER BY id").fetchall()
+        return [r["id"] for r in rows]
 
     def get_entry(self, entry_id: int) -> dict | None:
         with self._conn() as conn:

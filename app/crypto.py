@@ -23,6 +23,15 @@ class Box:
     def seal(self, text: str) -> bytes:
         return self._fernet.encrypt(text.encode())
 
+    def seal_bytes(self, data: bytes) -> bytes:
+        return self._fernet.encrypt(data)
+
+    def open_bytes(self, blob: bytes) -> bytes:
+        try:
+            return self._fernet.decrypt(blob)
+        except InvalidToken as exc:
+            raise RuntimeError("Could not decrypt stored data: SECRET_KEY has changed?") from exc
+
     def open(self, blob: bytes) -> str:
         try:
             return self._fernet.decrypt(blob).decode()

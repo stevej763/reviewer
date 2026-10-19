@@ -143,6 +143,7 @@ function showView(name) {
   document.querySelectorAll(".tabbar button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   $("#view-title").textContent = TITLES[name];
   history.replaceState(null, "", `#${name}`);
+  if (name === "log") loadLatest();
   if (name === "history") loadHistory();
   if (name === "reports") loadReports();
   if (name === "settings") loadSettings();
@@ -204,22 +205,35 @@ function stopRecording() {
 
 async function uploadRecording() {
   const type = rec.recorder.mimeType || rec.mime || "audio/webm";
-  const blob = new Blob(rec.chunks, { type });
+  rec.pending = new Blob(rec.chunks, { type });
   rec.recorder = null;
-  setRecordUI("busy", "Transcribing…");
+  await sendRecording();
+}
+
+// Uploads the last recording. The server stores it and answers straight away;
+// transcription and the summary happen in the background.
+async function sendRecording() {
+  const blob = rec.pending;
+  if (!blob) return;
+  $("#retry-upload").hidden = true;
+  setRecordUI("busy", "Saving your recording…");
   const form = new FormData();
-  form.append("audio", blob, type.includes("mp4") ? "recording.mp4" : "recording.webm");
+  form.append("audio", blob, blob.type.includes("mp4") ? "recording.mp4" : "recording.webm");
+  form.append("date", $("#entry-date").value || today());
+  if ($("#entry-provider").value) form.append("provider", $("#entry-provider").value);
   try {
-    const { text } = await api("/api/transcribe", { method: "POST", form });
-    const box = $("#entry-text");
-    box.value = [box.value.trim(), text].filter(Boolean).join("\n\n");
-    try { localStorage.setItem(DRAFT_KEY, box.value); } catch { /* ignore */ }
-    setRecordUI("idle", text ? "Got it. Record more, or save" : "Didn't catch anything. Try again?");
+    const entry = await api("/api/recordings", { method: "POST", form });
+    rec.pending = null;
+    $("#latest").prepend(renderSummary(entry, { onChange: loadLatest }));
+    setRecordUI("idle", "Saved ✓ Tap to record more");
+    toast("Recording saved. Processing in the background");
   } catch (err) {
-    $("#log-error").textContent = err.message;
-    setRecordUI("idle", "Tap to talk about your day");
+    $("#log-error").textContent = `Couldn't save the recording: ${err.message}`;
+    setRecordUI("idle", "Recording not saved yet");
+    $("#retry-upload").hidden = false;
   }
 }
+$("#retry-upload").addEventListener("click", sendRecording);
 
 $("#record").addEventListener("click", () => {
   if (rec.recorder && rec.recorder.state === "recording") stopRecording();
@@ -228,15 +242,37 @@ $("#record").addEventListener("click", () => {
 
 // ---------- entries ----------
 
+const PENDING = { transcribing: "Transcribing your recording…", summarising: "Writing your highlights…" };
+
 function renderSummary(entry, { onChange } = {}) {
   const s = entry.summary;
-  const card = el("article", { class: "card entry" });
-  const meta = entry.provider ? `${entry.provider} · ${entry.model}` : "not summarised";
+  const card = el("article", { class: "card entry", "data-entry-id": entry.id, "data-status": entry.status });
+  card._opts = { onChange };
+  const meta = PENDING[entry.status] ? "processing" : entry.provider ? `${entry.provider} · ${entry.model}` : "not summarised";
   card.append(el("div", { class: "entry-head" },
     el("span", { class: "entry-date" }, prettyDate(entry.date)),
     el("span", { class: "entry-meta" }, meta)));
 
-  if (entry.summary_error) card.append(el("div", { class: "warn" }, `Saved, but summarising failed: ${entry.summary_error}`));
+  if (PENDING[entry.status]) {
+    card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
+      el("div", {}, el("b", {}, PENDING[entry.status]),
+        el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background."))));
+    watchPending();
+  }
+  if (entry.status === "failed") {
+    card.append(el("div", { class: "warn" }, el("div", {}, entry.error || "Something went wrong."),
+      el("button", {
+        class: "btn small",
+        onclick: async (e) => {
+          await busy(e.currentTarget, "Retrying…", async () => {
+            try {
+              const updated = await api(`/api/entries/${entry.id}/retry`, { method: "POST" });
+              card.replaceWith(renderSummary(updated, { onChange }));
+            } catch (err) { toast(err.message); }
+          });
+        },
+      }, "Try again")));
+  }
 
   if (s) {
     if (s.headline) card.append(el("div", { class: "headline" }, s.headline));
@@ -253,29 +289,29 @@ function renderSummary(entry, { onChange } = {}) {
     if (s.tags.length) card.append(el("div", {}, s.tags.map((t) => el("span", { class: "tag" }, t))));
   }
 
-  card.append(el("details", {}, el("summary", {}, "What you said"), el("pre", {}, entry.text)));
+  if (entry.text) card.append(el("details", {}, el("summary", {}, "What you said"), el("pre", {}, entry.text)));
 
   const actions = el("div", { class: "entry-actions" });
-  if (state.providers.length) {
+  const busyNow = Boolean(PENDING[entry.status]);
+  if (state.providers.length && !busyNow && entry.text) {
     for (const p of state.providers) {
       actions.append(el("button", {
         class: "btn",
         onclick: async (e) => {
-          await busy(e.currentTarget, "Summarising…", async () => {
-            try {
-              const updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: p.name } });
-              card.replaceWith(renderSummary(updated, { onChange }));
-              toast("Re-summarised");
-            } catch (err) { toast(err.message); }
-          });
+          try {
+            const updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: p.name } });
+            card.replaceWith(renderSummary(updated, { onChange }));
+          } catch (err) { toast(err.message); }
         },
       }, state.providers.length > 1 ? `Redo with ${p.name === "claude" ? "Claude" : "Ollama"}` : "Redo summary"));
     }
   }
-  actions.append(el("button", {
-    class: "btn",
-    onclick: () => editEntry(entry, card, onChange),
-  }, "Edit"));
+  if (!busyNow && entry.text) {
+    actions.append(el("button", {
+      class: "btn",
+      onclick: () => editEntry(entry, card, onChange),
+    }, "Edit"));
+  }
   actions.append(el("button", {
     class: "btn danger",
     onclick: async () => {
@@ -290,6 +326,29 @@ function renderSummary(entry, { onChange } = {}) {
   }, "Delete"));
   card.append(actions);
   return card;
+}
+
+// While any entry on screen is still processing, check on it every few seconds
+// and swap in the finished card.
+let pendingTimer = null;
+function watchPending() {
+  if (pendingTimer) return;
+  pendingTimer = setTimeout(async () => {
+    pendingTimer = null;
+    const cards = [...document.querySelectorAll('.entry[data-status="transcribing"], .entry[data-status="summarising"]')];
+    if (!cards.length) return;
+    for (const card of cards) {
+      try {
+        const entry = await api(`/api/entries/${card.dataset.entryId}`);
+        if (entry.status !== card.dataset.status) {
+          card.replaceWith(renderSummary(entry, card._opts));
+          if (entry.status === "done") toast("Highlights ready");
+          if (entry.status === "failed") toast("An entry couldn't be processed");
+        }
+      } catch { /* try again next round */ }
+    }
+    if (document.querySelector('.entry[data-status="transcribing"], .entry[data-status="summarising"]')) watchPending();
+  }, 3000);
 }
 
 function editEntry(entry, card, onChange) {
@@ -311,7 +370,7 @@ function editEntry(entry, card, onChange) {
                 updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: entry.provider || state.defaultProvider } });
               }
               editor.replaceWith(renderSummary(updated, { onChange }));
-              toast("Saved");
+              toast(updated.status === "summarising" ? "Saved. Updating highlights…" : "Saved");
             } catch (err) { toast(err.message); }
           });
         },
@@ -323,7 +382,7 @@ $("#save-entry").addEventListener("click", async (e) => {
   $("#log-error").textContent = "";
   const text = $("#entry-text").value.trim();
   if (!text) { $("#log-error").textContent = "Say or type something first."; return; }
-  await busy(e.currentTarget, "Summarising…", async () => {
+  await busy(e.currentTarget, "Saving…", async () => {
     try {
       const entry = await api("/api/entries", {
         method: "POST",
@@ -331,9 +390,8 @@ $("#save-entry").addEventListener("click", async (e) => {
       });
       $("#entry-text").value = "";
       try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
-      $("#latest").prepend(renderSummary(entry));
-      setRecordUI("idle", "Tap to talk about your day");
-      toast(entry.summary_error ? "Saved without summary" : "Saved");
+      $("#latest").prepend(renderSummary(entry, { onChange: loadLatest }));
+      toast("Saved. Writing highlights in the background");
     } catch (err) {
       $("#log-error").textContent = err.message;
     }
@@ -344,6 +402,16 @@ $("#save-entry").addEventListener("click", async (e) => {
 $("#entry-text").addEventListener("input", (e) => {
   try { localStorage.setItem(DRAFT_KEY, e.target.value); } catch { /* storage unavailable */ }
 });
+
+// The selected day's entries, so you can see what's still processing when you come back.
+async function loadLatest() {
+  const day = $("#entry-date").value || today();
+  try {
+    const entries = await api(`/api/entries?start=${day}&end=${day}`);
+    $("#latest").replaceChildren(...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
+  } catch { /* shown elsewhere */ }
+}
+$("#entry-date").addEventListener("change", loadLatest);
 
 // ---------- history ----------
 

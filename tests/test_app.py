@@ -39,6 +39,19 @@ class FakeTranscriber:
         return f"heard {len(audio)} bytes as {suffix} in {language}"
 
 
+class DrainingClient(TestClient):
+    """Runs queued background work after every request, so tests see finished results."""
+
+    def request(self, *args, **kwargs):
+        response = super().request(*args, **kwargs)
+        self.app.state.worker.drain()
+        return response
+
+
+def entry(c, entry_id):
+    return c.get(f"/api/entries/{entry_id}").json()
+
+
 SETUP = {
     "profile": {"name": "Steve", "role": "Engineer", "company": "Acme", "goals": "Get promoted"},
     "pin": PIN,
@@ -55,8 +68,8 @@ def make_client(tmp_path, monkeypatch):
         monkeypatch.setenv("SECRET_KEY", "test-secret")
         settings = load_settings()
         app = create_app(settings, providers=providers if providers is not None else {"claude": FakeProvider()},
-                         transcriber=FakeTranscriber())
-        c = TestClient(app)
+                         transcriber=FakeTranscriber(), background=False)
+        c = DrainingClient(app)
         if setup:
             assert c.post("/api/setup", json=SETUP).status_code == 200
             c.cookies.clear()
@@ -104,7 +117,7 @@ def test_settings_hide_secrets_and_update(client):
 def test_change_pin_signs_out_other_devices(make_client):
     c1, _ = make_client()
     c1.post("/api/login", json={"pin": PIN})
-    c2 = TestClient(c1.app)
+    c2 = DrainingClient(c1.app)
     c2.post("/api/login", json={"pin": PIN})
     assert c1.post("/api/settings/pin", json={"current": "000000", "new": "112233"}).status_code == 400
     assert c1.post("/api/settings/pin", json={"current": PIN, "new": "112233"}).status_code == 200
@@ -166,8 +179,9 @@ def test_lockout_escalates_and_blocks_correct_pin():
 
 def test_entry_is_summarised_and_encrypted_at_rest(client, make_client):
     r = client.post("/api/entries", json={"date": "2026-10-19", "text": "Fixed the flaky deploy pipeline secretword"})
-    assert r.status_code == 200
-    entry = r.json()
+    assert r.status_code == 202 and r.json()["status"] == "summarising"
+    entry = client.get(f"/api/entries/{r.json()['id']}").json()
+    assert entry["status"] == "done"
     assert entry["summary"]["headline"] == "Did things on 2026-10-19"
     assert entry["summary"]["tags"] == ["release"]
     assert entry["provider"] == "claude"
@@ -180,20 +194,21 @@ def test_entry_is_summarised_and_encrypted_at_rest(client, make_client):
 def test_failed_summary_still_saves_text(make_client):
     c, _ = make_client({"claude": FakeProvider(fail=True)})
     c.post("/api/login", json={"pin": PIN})
-    entry = c.post("/api/entries", json={"date": "2026-10-19", "text": "Important stuff"}).json()
-    assert entry["summary"] is None
-    assert entry["summary_error"] == "boom"
+    e = entry(c, c.post("/api/entries", json={"date": "2026-10-19", "text": "Important stuff"}).json()["id"])
+    assert e["summary"] is None and e["status"] == "failed" and e["error"] == "boom"
     assert c.get("/api/entries").json()[0]["text"] == "Important stuff"
 
 
 def test_switch_provider_and_resummarise(make_client):
     c, _ = make_client({"claude": FakeProvider("claude"), "ollama": FakeProvider("ollama")})
     c.post("/api/login", json={"pin": PIN})
-    entry = c.post("/api/entries", json={"date": "2026-10-19", "text": "x", "provider": "ollama"}).json()
-    assert entry["model"] == "fake-ollama"
-    redo = c.post(f"/api/entries/{entry['id']}/summarize", json={"provider": "claude"}).json()
-    assert redo["model"] == "fake-claude"
-    assert c.post(f"/api/entries/{entry['id']}/summarize", json={"provider": "nope"}).status_code == 400
+    eid = c.post("/api/entries", json={"date": "2026-10-19", "text": "x", "provider": "ollama"}).json()["id"]
+    assert entry(c, eid)["model"] == "fake-ollama"
+    c.post(f"/api/entries/{eid}/summarize", json={"provider": "claude"})
+    assert entry(c, eid)["model"] == "fake-claude"
+    c.post(f"/api/entries/{eid}/summarize", json={"provider": "nope"})
+    bad = entry(c, eid)
+    assert bad["status"] == "failed" and "isn't set up" in bad["error"]
 
 
 def test_edit_filter_delete(client):
@@ -242,9 +257,60 @@ def test_report_prompt_contains_entries(make_client):
     assert "2026-10-01" in prompt and "Unblocked the team" in prompt and "focus on leadership" in prompt
 
 
-def test_transcribe(client):
-    r = client.post("/api/transcribe", files={"audio": ("r.mp4", b"abc", "audio/mp4")})
-    assert r.json() == {"text": "heard 3 bytes as .mp4 in en"}
+def test_recording_is_saved_then_processed(make_client, tmp_path):
+    c, _ = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    worker = c.app.state.worker
+    # Upload without draining: the server answers before any processing happens.
+    r = TestClient.request(c, "POST", "/api/recordings", data={"date": "2026-10-19"},
+                           files={"audio": ("r.mp4", b"secret-audio", "audio/mp4")})
+    assert r.status_code == 202 and r.json()["status"] == "transcribing"
+    eid = r.json()["id"]
+    audio_files = list((tmp_path / "pending-audio").iterdir())
+    assert len(audio_files) == 1 and b"secret-audio" not in audio_files[0].read_bytes()  # encrypted
+
+    worker.drain()
+    e = entry(c, eid)
+    assert e["status"] == "done" and e["text"] == "heard 12 bytes as .mp4 in en"
+    assert e["summary"]["headline"]
+    assert not list((tmp_path / "pending-audio").iterdir())  # audio deleted once transcribed
+
+
+def test_unfinished_work_resumes_after_restart(make_client, tmp_path):
+    c, settings = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    r = TestClient.request(c, "POST", "/api/recordings", data={"date": "2026-10-19"},
+                           files={"audio": ("r.webm", b"abc", "audio/webm")})
+    eid = r.json()["id"]
+    # "Restart": a new app on the same data picks the job back up.
+    app2 = create_app(settings, providers={"claude": FakeProvider()}, transcriber=FakeTranscriber(), background=False)
+    for pending in app2.state.store.pending_entry_ids():
+        app2.state.worker.enqueue(pending)
+    app2.state.worker.drain()
+    assert app2.state.store.get_entry(eid)["status"] == "done"
+
+
+def test_failed_transcription_can_be_retried(make_client):
+    class Flaky(FakeTranscriber):
+        calls = 0
+
+        def transcribe(self, audio, suffix=".webm", language=None):
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise RuntimeError("decoder crashed")
+            return "worked second time"
+
+    c, settings = make_client()
+    app = create_app(settings, providers={"claude": FakeProvider()}, transcriber=Flaky(), background=False)
+    c = DrainingClient(app)
+    c.post("/api/login", json={"pin": PIN})
+    eid = c.post("/api/recordings", data={"date": "2026-10-19"},
+                 files={"audio": ("r.webm", b"abc", "audio/webm")}).json()["id"]
+    e = entry(c, eid)
+    assert e["status"] == "failed" and "decoder crashed" in e["error"]
+    c.post(f"/api/entries/{eid}/retry")
+    assert entry(c, eid)["text"] == "worked second time"
+    assert c.post(f"/api/entries/{eid}/retry").status_code == 409  # only failed entries
 
 
 def test_security_headers_and_static(client):
