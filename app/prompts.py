@@ -105,6 +105,17 @@ What I delivered, In progress, Blockers / risks, Next up. Keep it tight; favour 
 worked on, what I learned, what went well and what didn't. Use a # title and a few ## sections. Keep internal
 names generic if they look sensitive (e.g. "an internal billing service") since this may be shared publicly.""",
     },
+    "daily": {
+        "label": "Daily notes",
+        "instructions": """Write tidy notes for a single work day, for my own records or to share with my manager.
+# title with the date, then: Summary (2-3 sentences), What I did (bullets, grouped by project where it helps),
+Wins, Blockers / challenges, Tomorrow (outstanding follow-ups). Leave out any section with nothing in it.
+Keep it factual and specific; use details from what I actually said.""",
+    },
+    "custom": {
+        "label": "Custom (write your own prompt)",
+        "instructions": "Follow my instructions below for what to write and how to format it.",
+    },
 }
 
 REPORT_SYSTEM = """You write reports about someone's work from their own daily work log.

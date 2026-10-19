@@ -103,6 +103,8 @@
       <div class="card">
         <h2>New report</h2>
         <div class="chips" id="range-presets">
+          <button class="chip" data-range="today">Today</button>
+          <button class="chip" data-range="yesterday">Yesterday</button>
           <button class="chip" data-range="week">Last 7 days</button>
           <button class="chip" data-range="month">Last 30 days</button>
           <button class="chip" data-range="quarter">This quarter</button>
@@ -114,7 +116,7 @@
           <label>To <input type="date" id="rep-end"></label>
         </div>
         <label>Type <select id="rep-style"></select></label>
-        <label>Anything to emphasise? <span class="muted">(optional)</span>
+        <label><span id="rep-notes-label">Anything to emphasise? <span class="muted">(optional)</span></span>
           <textarea id="rep-notes" rows="2" placeholder="e.g. focus on leadership, I'm going for promotion"></textarea>
         </label>
         <div class="actions">

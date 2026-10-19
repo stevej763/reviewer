@@ -146,7 +146,7 @@ class ReportIn(BaseModel):
     end: str
     style: str = "review"
     provider: str | None = None
-    notes: str = Field(default="", max_length=2000)
+    notes: str = Field(default="", max_length=6000)
 
     @field_validator("start", "end")
     @classmethod
@@ -470,6 +470,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     def create_report(body: ReportIn):
         if body.start > body.end:
             raise HTTPException(400, "Start date is after end date.")
+        if body.style == "custom" and not body.notes.strip():
+            raise HTTPException(400, "Write your prompt for the custom report.")
         # Skip recordings that haven't been transcribed yet.
         entries = [e for e in store.list_entries(body.start, body.end) if e["text"].strip()]
         if not entries:

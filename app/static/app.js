@@ -514,16 +514,47 @@ $("#hist-apply").addEventListener("click", loadHistory);
 function setRange(kind) {
   const now = new Date();
   let start = new Date(now);
+  let end = new Date(now);
+  if (kind === "yesterday") { start.setDate(now.getDate() - 1); end = new Date(start); }
   if (kind === "week") start.setDate(now.getDate() - 6);
   if (kind === "month") start.setDate(now.getDate() - 29);
   if (kind === "quarter") start = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
   if (kind === "half") start.setMonth(now.getMonth() - 6);
   if (kind === "year") start = new Date(now.getFullYear(), 0, 1);
   $("#rep-start").value = isoDate(start);
-  $("#rep-end").value = isoDate(now);
+  $("#rep-end").value = isoDate(end);
   document.querySelectorAll("#range-presets .chip").forEach((c) => c.classList.toggle("active", c.dataset.range === kind));
 }
 document.querySelectorAll("#range-presets .chip").forEach((c) => c.addEventListener("click", () => setRange(c.dataset.range)));
+
+// The notes box doubles as the prompt for a custom report; remember each separately.
+const CUSTOM_PROMPT_KEY = "reviewer-custom-prompt";
+let lastStyle = null;
+function onStyleChange() {
+  const style = $("#rep-style").value;
+  const notes = $("#rep-notes");
+  const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* ignore */ } };
+  const load = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
+  if (lastStyle === "custom") store(CUSTOM_PROMPT_KEY, notes.value);
+  if (style === "custom") {
+    $("#rep-notes-label").textContent = "Your prompt";
+    notes.placeholder = "e.g. Turn this into a short Slack update for my team: three bullets, plain language, no headings.";
+    notes.rows = 5;
+    notes.value = load(CUSTOM_PROMPT_KEY);
+  } else {
+    $("#rep-notes-label").replaceChildren("Anything to emphasise? ", el("span", { class: "muted" }, "(optional)"));
+    notes.placeholder = "e.g. focus on leadership, I'm going for promotion";
+    notes.rows = 2;
+    if (lastStyle === "custom") notes.value = "";
+  }
+  // Daily notes are about one day: default to today unless a single day is already picked.
+  if (style === "daily" && $("#rep-start").value !== $("#rep-end").value) setRange("today");
+  lastStyle = style;
+}
+$("#rep-style").addEventListener("change", onStyleChange);
+$("#rep-notes").addEventListener("input", (e) => {
+  if ($("#rep-style").value === "custom") { try { localStorage.setItem(CUSTOM_PROMPT_KEY, e.target.value); } catch { /* ignore */ } }
+});
 
 function renderReport(report) {
   const body = el("div", { class: "report-body" });

@@ -378,3 +378,27 @@ def test_day_summary_input_includes_every_entry():
                              {"text": "two", "created_at": "2026-10-19T15:30:00+00:00"}], "2026-10-19")
     assert 'recorded_at="09:05 UTC"' in seen["text"] and "two" in seen["text"]
     assert "end-of-day" in seen["system"]
+
+
+def test_daily_and_custom_reports(make_client):
+    fake = FakeProvider()
+    c, _ = make_client({"claude": fake})
+    c.post("/api/login", json={"pin": PIN})
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "Spoke to the PSP about refunds"})
+    r = c.post("/api/reports", json={"start": "2026-10-19", "end": "2026-10-19", "style": "daily"})
+    assert r.status_code == 200
+    assert "Daily notes" in fake.prompts[-1] and "What I said:\nSpoke to the PSP" in fake.prompts[-1]
+
+    assert c.post("/api/reports", json={"start": "2026-10-19", "end": "2026-10-19", "style": "custom"}).status_code == 400
+    c.post("/api/reports", json={"start": "2026-10-19", "end": "2026-10-19", "style": "custom",
+                                 "notes": "Write it as a haiku"})
+    assert "My instructions:\nWrite it as a haiku" in fake.prompts[-1]
+
+
+def test_long_ranges_use_summaries_only(make_client):
+    fake = FakeProvider()
+    c, _ = make_client({"claude": fake})
+    c.post("/api/login", json={"pin": PIN})
+    c.post("/api/entries", json={"date": "2026-10-01", "text": "raw words here"})
+    c.post("/api/reports", json={"start": "2026-09-01", "end": "2026-10-31"})
+    assert "What I said" not in fake.prompts[-1]

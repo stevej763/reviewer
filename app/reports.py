@@ -17,8 +17,10 @@ def _fmt_list(label: str, items: list[str]) -> str:
     return f"{label}: {'; '.join(items)}\n" if items else ""
 
 
-def entries_digest(entries: list[dict]) -> str:
-    """Compact, chronological text of summaries to hand to the model."""
+def entries_digest(entries: list[dict], include_text: bool = False) -> str:
+    """Compact, chronological text of summaries to hand to the model.
+
+    `include_text` adds what was actually said, for short periods where detail matters."""
     lines = []
     for entry in sorted(entries, key=lambda e: (e["date"], e["id"])):
         s = entry.get("summary")
@@ -42,6 +44,8 @@ def entries_digest(entries: list[dict]) -> str:
         )
         if block:
             lines.append(block.rstrip())
+        if include_text and entry["text"].strip():
+            lines.append(f"What I said:\n{entry['text'].strip()}")
         lines.append("")
     return "\n".join(lines)
 
@@ -55,8 +59,11 @@ def report_prompt(entries: list[dict], start: str, end: str, style: str, notes: 
         f"Report type: {spec['label']}\n{spec['instructions']}\n"
     )
     if notes.strip():
-        prompt += f"\nExtra guidance from me:\n{notes.strip()}\n"
-    prompt += f"\n<work_log>\n{entries_digest(entries)}\n</work_log>"
+        label = "My instructions" if style == "custom" else "Extra guidance from me"
+        prompt += f"\n{label}:\n{notes.strip()}\n"
+    # For a few days, pass the full transcripts too, not just the summaries.
+    short = (date.fromisoformat(end) - date.fromisoformat(start)).days <= 6
+    prompt += f"\n<work_log>\n{entries_digest(entries, include_text=short)}\n</work_log>"
     return REPORT_SYSTEM, prompt
 
 
