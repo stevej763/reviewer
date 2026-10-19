@@ -479,7 +479,7 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
     goals: input({ rows: 3, placeholder: "e.g. Working towards Staff Engineer; my review focuses on technical leadership and cross-team impact" }, p.goals),
     pin: input({ type: "password", inputmode: "numeric", autocomplete: "new-password", placeholder: "4 to 12 digits" }),
     pin2: input({ type: "password", inputmode: "numeric", autocomplete: "new-password" }),
-    ollamaUrl: input({ placeholder: "http://host.docker.internal:11434" }, ai.ollama_url),
+    ollamaUrl: input({ placeholder: "http://ollama:11434" }, ai.ollama_url),
     ollamaModel: input({ list: "model-suggestions", autocapitalize: "off", spellcheck: "false" }, ai.ollama_model),
     claudeKey: input({ type: "password", autocomplete: "off",
       placeholder: ai.anthropic_key_set ? `Saved (${ai.anthropic_key_hint || "hidden"}). Leave blank to keep` : "sk-ant-… (optional)" }),
@@ -574,7 +574,7 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
   const ollamaBox = el("div", { class: "settings-form" },
     field("Ollama address", el("div", { class: "inline" }, f.ollamaUrl,
       el("button", { type: "button", class: "btn small", onclick: checkOllama }, "Check")),
-    "Ollama running on this Mac is reachable from Docker at http://host.docker.internal:11434"),
+    "http://ollama:11434 for the Ollama container, or http://host.docker.internal:11434 for the native Ollama app"),
     status, progress,
     field("Model", f.ollamaModel), suggestions, picks, downloadBtn);
   const claudeBox = el("div", { class: "settings-form" },
