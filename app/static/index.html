@@ -132,7 +132,13 @@
 
     <!-- Settings view -->
     <section id="view-settings" class="view" hidden>
+      <div class="segmented" id="settings-tabs" role="tablist">
+        <button role="tab" data-tab="profile">About you</button>
+        <button role="tab" data-tab="ai">AI &amp; speech</button>
+        <button role="tab" data-tab="security">PIN &amp; data</button>
+      </div>
       <div id="settings-form"></div>
+      <div id="settings-security" class="view" hidden>
       <div class="card">
         <h2>Change PIN</h2>
         <div class="grid2">
@@ -150,6 +156,7 @@
           <a class="btn small" href="/api/export/backup.json">Download backup (JSON)</a>
           <a class="btn small" href="/api/export/highlights.csv">All highlights (CSV)</a>
         </div>
+      </div>
       </div>
     </section>
 

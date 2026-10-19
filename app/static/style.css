@@ -260,3 +260,14 @@ details pre { white-space: pre-wrap; font: inherit; font-size: .92rem; margin: .
   animation: spin .9s linear infinite;
 }
 .warn { display: grid; gap: 8px; justify-items: start; }
+
+/* Settings tabs */
+.segmented {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px;
+  background: var(--surface-2); border-radius: 12px; padding: 4px;
+}
+.segmented button {
+  border: 0; background: none; border-radius: 9px; padding: .55rem .3rem; min-height: 40px;
+  font-size: .88rem; font-weight: 600; color: var(--muted); cursor: pointer;
+}
+.segmented button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }

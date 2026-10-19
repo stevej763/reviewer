@@ -537,7 +537,9 @@ function formatBytes(n) {
 }
 
 // Builds the profile / AI / speech form used by both first-time setup and Settings.
-function settingsForm(cfg, { setup = false, onSaved } = {}) {
+// `parts` picks which sections to show: Settings splits them across tabs, setup shows them all.
+function settingsForm(cfg, { setup = false, onSaved, parts = ["profile", "ai", "speech"] } = {}) {
+  const has = (part) => parts.includes(part);
   const p = cfg.profile;
   const ai = cfg.ai;
   const f = {
@@ -654,7 +656,7 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
   const save = el("button", { type: "submit", class: "btn primary" }, setup ? "Finish setup" : "Save settings");
 
   const form = el("form", { class: "settings-form", autocomplete: "off" },
-    el("section", { class: "card" },
+    has("profile") ? el("section", { class: "card" },
       el("h2", {}, "About you"),
       el("p", { class: "muted small" }, "Used to tailor your summaries and reports."),
       field("Your name", f.name),
@@ -662,21 +664,21 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
       field("Team / company", f.company),
       field("Goals and what matters in your role", f.goals, "Optional. Reports will emphasise these."),
       field("Background for the AI", f.context,
-        "Optional. Projects, people, team names and acronyms you mention often. Included with every summary and report, so it can make sense of what you say and spell names right.")),
+        "Optional. Projects, people, team names and acronyms you mention often. Included with every summary and report, so it can make sense of what you say and spell names right.")) : null,
     setup ? el("section", { class: "card" },
       el("h2", {}, "Choose a PIN"),
       el("p", { class: "muted small" }, "You'll type this to unlock the app. Use 6+ digits."),
       el("div", { class: "grid2" }, field("PIN", f.pin), field("Confirm PIN", f.pin2))) : null,
-    el("section", { class: "card" },
+    has("ai") ? el("section", { class: "card" },
       el("h2", {}, "AI model"),
       el("p", { class: "muted small" }, "Turns what you say into highlights and writes your reports."),
       providers,
       el("h3", { class: "subhead" }, "Local model (Ollama)"), ollamaBox,
-      el("h3", { class: "subhead" }, "Claude (optional)"), claudeBox),
-    el("section", { class: "card" },
+      el("h3", { class: "subhead" }, "Claude (optional)"), claudeBox) : null,
+    has("speech") ? el("section", { class: "card" },
       el("h2", {}, "Speech"),
-      el("p", { class: "muted small" }, "Recordings are transcribed on this machine and never stored."),
-      field("Language you speak in", f.language)),
+      el("p", { class: "muted small" }, "Recordings are transcribed on this machine and deleted once transcribed."),
+      field("Language you speak in", f.language)) : null,
     el("div", { class: "actions" }, save),
     error);
 
@@ -684,21 +686,24 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
     e.preventDefault();
     error.textContent = "";
     const provider = form.querySelector("input[type=radio]:checked")?.value || "ollama";
-    const body = {
-      profile: {
+    const body = {};
+    if (has("profile")) {
+      body.profile = {
         name: f.name.value.trim(), role: f.role.value.trim(), company: f.company.value.trim(),
         goals: f.goals.value.trim(), context: f.context.value.trim(),
-      },
-      ai: {
+      };
+    }
+    if (has("ai")) {
+      body.ai = {
         provider,
         ollama_url: f.ollamaUrl.value.trim(),
         ollama_model: f.ollamaModel.value.trim(),
         anthropic_api_key: f.claudeKey.value.trim() || null,
         anthropic_model: f.claudeModel.value.trim(),
-      },
-      speech: { language: f.language.value },
-    };
-    if (provider === "claude" && !body.ai.anthropic_api_key && !ai.anthropic_key_set) {
+      };
+    }
+    if (has("speech")) body.speech = { language: f.language.value };
+    if (has("ai") && provider === "claude" && !body.ai.anthropic_api_key && !ai.anthropic_key_set) {
       error.textContent = "Add an Anthropic API key to use Claude, or pick the local model.";
       return;
     }
@@ -714,6 +719,7 @@ function settingsForm(cfg, { setup = false, onSaved } = {}) {
     });
   });
 
+  if (!has("ai")) return form;
   renderPicks();
   if (ai.ollama_url) checkOllama();
   // Resume showing progress if a download is already running.
@@ -731,14 +737,28 @@ function showSetup(defaults) {
   }));
 }
 
-async function loadSettings() {
+const SETTINGS_TABS = { profile: ["profile"], ai: ["ai", "speech"], security: [] };
+let settingsTab = "profile";
+
+async function loadSettings(tab = settingsTab) {
+  settingsTab = SETTINGS_TABS[tab] ? tab : "profile";
+  document.querySelectorAll("#settings-tabs button").forEach((b) => {
+    const active = b.dataset.tab === settingsTab;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
+  });
+  $("#settings-security").hidden = settingsTab !== "security";
+  $("#settings-form").hidden = settingsTab === "security";
+  if (settingsTab === "security") return;
   try {
     const cfg = await api("/api/settings");
     $("#settings-form").replaceChildren(settingsForm(cfg, {
+      parts: SETTINGS_TABS[settingsTab],
       onSaved: async () => { toast("Settings saved"); await refreshSession(); },
     }));
   } catch (err) { toast(err.message); }
 }
+document.querySelectorAll("#settings-tabs button").forEach((b) => b.addEventListener("click", () => loadSettings(b.dataset.tab)));
 
 $("#change-pin").addEventListener("click", async (e) => {
   $("#pin-error").textContent = "";
