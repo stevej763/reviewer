@@ -31,7 +31,7 @@ async function api(path, { method = "GET", body, form } = {}) {
   const res = await fetch(path, opts);
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
-  if (res.status === 409 && path !== "/api/setup") {
+  if (res.status === 409 && data && data.detail === "Finish setting up the app first.") {
     boot();
     throw new Error((data && data.detail) || "Setup needed");
   }
@@ -42,6 +42,7 @@ async function api(path, { method = "GET", body, form } = {}) {
   if (!res.ok) {
     let msg = data && data.detail;
     if (Array.isArray(msg)) msg = msg.map((d) => d.msg).join("; ");
+    if (msg && typeof msg === "object") msg = msg.message;
     throw new Error(msg || `Request failed (${res.status})`);
   }
   return data;
@@ -154,8 +155,17 @@ $("#open-settings").addEventListener("click", () => showView("settings"));
 document.querySelectorAll(".tabbar button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
 
 // ---------- recording ----------
+//
+// A recording is uploaded in pieces while you talk: the server starts an entry, each
+// CHUNK_MS of audio is sent as soon as the browser has it (retrying until it gets through),
+// and stopping just tells the server to put the pieces together. If the tab closes or the
+// phone locks mid-way, everything already uploaded is kept and transcribed.
 
-const rec = { recorder: null, chunks: [], stream: null, started: 0, timer: null, mime: "" };
+const CHUNK_MS = 10_000;
+const rec = {
+  recorder: null, stream: null, started: 0, timer: null, mime: "",
+  id: null, seq: 0, queue: [], uploading: false, stopped: false, sent: 0, retryDelay: 0, wakeLock: null,
+};
 
 function pickMime() {
   const options = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
@@ -172,8 +182,37 @@ function setRecordUI(mode, label) {
   if (mode !== "recording") $("#record-timer").textContent = "";
 }
 
+const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+
+function recordingStatus() {
+  const waiting = rec.queue.length;
+  const saved = `saved up to ${clock(rec.sent * CHUNK_MS)}`;
+  if (rec.retryDelay) return `Connection problem, retrying… (${waiting} piece${waiting === 1 ? "" : "s"} waiting)`;
+  return rec.stopped ? `Finishing… ${saved}` : `Listening… tap to stop · ${saved}`;
+}
+
+// ----- keep the screen on, and warn before leaving, while a recording is in flight -----
+
+async function keepAwake() {
+  try { rec.wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* not supported or refused */ }
+}
+document.addEventListener("visibilitychange", () => {
+  // The browser drops the wake lock when the page is hidden; take it again on return.
+  if (document.visibilityState === "visible" && rec.id && (!rec.wakeLock || rec.wakeLock.released)) keepAwake();
+});
+function letSleep() {
+  try { rec.wakeLock?.release(); } catch { /* ignore */ }
+  rec.wakeLock = null;
+}
+window.addEventListener("beforeunload", (e) => {
+  if (rec.id) { e.preventDefault(); e.returnValue = ""; }  // recording or pieces still uploading
+});
+
+// ----- recording -----
+
 async function startRecording() {
   $("#log-error").textContent = "";
+  $("#retry-upload").hidden = true;
   if (!navigator.mediaDevices || !window.MediaRecorder) {
     $("#log-error").textContent = "Recording needs HTTPS (or localhost) and a modern browser. You can still type.";
     return;
@@ -185,60 +224,105 @@ async function startRecording() {
     return;
   }
   rec.mime = pickMime();
-  rec.chunks = [];
+  setRecordUI("busy", "Starting…");
+  try {
+    const entry = await api("/api/recordings/start", {
+      method: "POST",
+      body: { date: $("#entry-date").value || today(), provider: $("#entry-provider").value || null, mime: rec.mime },
+    });
+    Object.assign(rec, { id: entry.id, seq: 0, queue: [], sent: 0, stopped: false, retryDelay: 0 });
+  } catch (err) {
+    rec.stream.getTracks().forEach((t) => t.stop());
+    setRecordUI("idle", "Tap to talk about your day");
+    $("#log-error").textContent = `Couldn't start recording: ${err.message}`;
+    return;
+  }
   rec.recorder = new MediaRecorder(rec.stream, rec.mime ? { mimeType: rec.mime } : undefined);
-  rec.recorder.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
-  rec.recorder.onstop = uploadRecording;
-  rec.recorder.start(1000);
+  rec.recorder.ondataavailable = (e) => {
+    if (e.data.size) { rec.queue.push({ seq: rec.seq++, blob: e.data }); pumpChunks(); }
+  };
+  rec.recorder.onstop = () => { rec.stopped = true; pumpChunks(); };
+  rec.recorder.start(CHUNK_MS);
   rec.started = Date.now();
-  setRecordUI("recording", "Listening… tap to stop");
+  keepAwake();
+  setRecordUI("recording", recordingStatus());
   rec.timer = setInterval(() => {
-    const s = Math.floor((Date.now() - rec.started) / 1000);
-    $("#record-timer").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    $("#record-timer").textContent = clock(Date.now() - rec.started);
+    $("#record-label").textContent = recordingStatus();
   }, 250);
 }
 
 function stopRecording() {
   clearInterval(rec.timer);
-  rec.recorder.stop();
+  setRecordUI("busy", "Finishing…");
+  rec.recorder.stop();  // fires a last dataavailable, then onstop
   rec.stream.getTracks().forEach((t) => t.stop());
 }
 
-async function uploadRecording() {
-  const type = rec.recorder.mimeType || rec.mime || "audio/webm";
-  rec.pending = new Blob(rec.chunks, { type });
-  rec.recorder = null;
-  await sendRecording();
+// Sends queued pieces one at a time, in order. A failed piece is retried with backoff
+// (2s, 4s… up to 30s) until it gets through; nothing is dropped while the page is open.
+async function pumpChunks() {
+  if (rec.uploading || !rec.id) return;
+  rec.uploading = true;
+  try {
+    while (rec.queue.length) {
+      const { seq, blob } = rec.queue[0];
+      try {
+        const res = await fetch(`/api/recordings/${rec.id}/chunks/${seq}`, {
+          method: "PUT", body: blob, credentials: "same-origin",
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+        if (res.status === 401) { showLogin(); throw new Error("signed out"); }
+        if (res.status === 409) {
+          // The server already wrapped this recording up (it looked abandoned); stop sending.
+          rec.queue = [];
+          $("#log-error").textContent = "This recording was saved up to the point the connection dropped. Start a new one to add more.";
+          break;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        rec.queue.shift();
+        rec.sent = seq + 1;
+        rec.retryDelay = 0;
+      } catch {
+        rec.retryDelay = Math.min((rec.retryDelay || 1000) * 2, 30_000);
+        if (rec.stopped) setRecordUI("busy", recordingStatus());
+        await new Promise((r) => setTimeout(r, rec.retryDelay));
+      }
+    }
+  } finally {
+    rec.uploading = false;
+  }
+  if (rec.stopped && !rec.queue.length) finishRecording();
 }
 
-// Uploads the last recording. The server stores it and answers straight away;
-// transcription and the summary happen in the background.
-async function sendRecording() {
-  const blob = rec.pending;
-  if (!blob) return;
-  $("#retry-upload").hidden = true;
+async function finishRecording() {
+  if (!rec.id) return;
   setRecordUI("busy", "Saving your recording…");
-  const form = new FormData();
-  form.append("audio", blob, blob.type.includes("mp4") ? "recording.mp4" : "recording.webm");
-  form.append("date", $("#entry-date").value || today());
-  if ($("#entry-provider").value) form.append("provider", $("#entry-provider").value);
   try {
-    const entry = await api("/api/recordings", { method: "POST", form });
-    rec.pending = null;
+    const entry = await api(`/api/recordings/${rec.id}/finish`, { method: "POST", body: { chunks: rec.seq } });
+    rec.id = null;
+    letSleep();
     addToLatest(renderSummary(entry, { onChange: loadLatest }));
     setRecordUI("idle", "Saved ✓ Tap to record more");
     toast("Recording saved. Processing in the background");
   } catch (err) {
-    $("#log-error").textContent = `Couldn't save the recording: ${err.message}`;
-    setRecordUI("idle", "Recording not saved yet");
+    if (/already been finished/.test(err.message)) {
+      rec.id = null;
+      letSleep();
+      setRecordUI("idle", "Tap to talk about your day");
+      loadLatest();
+      return;
+    }
+    $("#log-error").textContent = `Couldn't finish saving the recording: ${err.message}`;
+    setRecordUI("idle", "Recording uploaded, not finished yet");
     $("#retry-upload").hidden = false;
   }
 }
-$("#retry-upload").addEventListener("click", sendRecording);
+$("#retry-upload").addEventListener("click", () => { $("#retry-upload").hidden = true; finishRecording(); });
 
 $("#record").addEventListener("click", () => {
   if (rec.recorder && rec.recorder.state === "recording") stopRecording();
-  else startRecording();
+  else if (!rec.id) startRecording();
 });
 
 // ---------- entries ----------
@@ -352,6 +436,26 @@ function renderSummary(entry, { onChange } = {}) {
         el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background.")),
       cancel));
     watchPending();
+  }
+  if (entry.status === "recording") {
+    if (entry.id === rec.id) {
+      card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
+        el("b", {}, "Recording… each piece is saved as you talk")));
+    } else {
+      card.append(el("div", { class: "warn" },
+        el("div", {}, "This recording didn't finish uploading (the page closed or lost connection). Everything that reached the server is safe. It's processed automatically after 10 minutes, or now:"),
+        el("button", {
+          class: "btn small",
+          onclick: async (e) => {
+            await busy(e.currentTarget, "Processing…", async () => {
+              try {
+                const updated = await api(`/api/recordings/${entry.id}/finish`, { method: "POST", body: { chunks: 0, partial: true } });
+                card.replaceWith(renderSummary(updated, { onChange }));
+              } catch (err) { toast(err.message); }
+            });
+          },
+        }, "Process what was saved")));
+    }
   }
   if (entry.status === "failed") {
     card.append(el("div", { class: "warn" }, el("div", {}, entry.error || "Something went wrong."),

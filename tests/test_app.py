@@ -491,3 +491,54 @@ def test_transcription_progress_is_reported(make_client):
     app.state.worker.drain()
     assert seen == [0.25, 0.5, 1.0]
     assert "progress" not in c.get(f"/api/entries/{eid}").json()
+
+
+
+def test_chunked_recording(make_client, tmp_path):
+    captured = {}
+
+    class Capture(FakeTranscriber):
+        def transcribe(self, audio, suffix=".webm", language=None, model_name=None, on_progress=None):
+            captured.update(audio=audio, suffix=suffix)
+            return "joined up"
+
+    c, settings = make_client()
+    app = create_app(settings, providers={"claude": FakeProvider()}, transcriber=Capture(), background=False)
+    c = DrainingClient(app)
+    c.post("/api/login", json={"pin": PIN})
+    rec = c.post("/api/recordings/start", json={"date": "2026-10-21", "mime": "audio/mp4"}).json()
+    assert rec["status"] == "recording"
+    rid = rec["id"]
+    for seq, piece in ((0, b"aaa"), (2, b"ccc"), (1, b"bbb"), (1, b"bbb")):  # out of order + a resend
+        assert c.put(f"/api/recordings/{rid}/chunks/{seq}", content=piece).status_code == 200
+    stored = b"".join(p.read_bytes() for p in (tmp_path / "pending-audio" / f"{rid}.chunks").glob("*.part"))
+    assert b"aaa" not in stored  # encrypted on disk
+
+    r = c.post(f"/api/recordings/{rid}/finish", json={"chunks": 4})
+    assert r.status_code == 409 and r.json()["detail"]["missing"] == [3]
+    c.post(f"/api/recordings/{rid}/finish", json={"chunks": 3})
+    assert captured == {"audio": b"aaabbbccc", "suffix": ".mp4"}
+    e = entry(c, rid)
+    assert e["status"] == "done" and e["text"] == "joined up"
+    assert not list((tmp_path / "pending-audio").iterdir())
+    assert c.put(f"/api/recordings/{rid}/chunks/3", content=b"x").status_code == 409
+
+
+def test_interrupted_recording_is_salvaged(make_client):
+    c, _ = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    worker = c.app.state.worker
+    # The tab dies after two chunks, and a gap means chunk 3 can't be used.
+    rid = c.post("/api/recordings/start", json={"date": "2026-10-21", "mime": "audio/webm"}).json()["id"]
+    for seq in (0, 1, 3):
+        c.put(f"/api/recordings/{rid}/chunks/{seq}", content=b"x" * 10)
+    assert worker.salvage_interrupted(idle_seconds=3600) == []  # still recent: leave it alone
+    assert worker.salvage_interrupted(idle_seconds=0) == [rid]
+    worker.drain()
+    e = entry(c, rid)
+    assert e["status"] == "done" and e["text"] == "heard 20 bytes as .webm in en"
+
+    # Nothing arrived at all: it's marked failed rather than left hanging
+    empty = c.post("/api/recordings/start", json={"date": "2026-10-21"}).json()["id"]
+    worker.salvage_interrupted(idle_seconds=0)
+    assert entry(c, empty)["status"] == "failed"

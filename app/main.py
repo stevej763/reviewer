@@ -26,6 +26,7 @@ from .transcribe import Transcriber
 log = logging.getLogger("reviewer")
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_AUDIO_BYTES = 50 * 1024 * 1024
+MAX_CHUNK_BYTES = 10 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 
 
@@ -144,6 +145,22 @@ class EntryUpdate(BaseModel):
     @classmethod
     def _date(cls, v):
         return _check_date(v) if v else v
+
+
+class RecordingStartIn(BaseModel):
+    date: str
+    provider: str | None = None
+    mime: str = Field(default="", max_length=100)
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v):
+        return _check_date(v)
+
+
+class RecordingFinishIn(BaseModel):
+    chunks: int = Field(ge=0)
+    partial: bool = False  # process what arrived even if pieces are missing
 
 
 class SummarizeIn(BaseModel):
@@ -361,6 +378,55 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     # ---- speech ----------------------------------------------------------
 
+    def audio_suffix(content_type: str) -> str:
+        content_type = (content_type or "").lower()
+        if any(t in content_type for t in ("mp4", "m4a", "aac")):
+            return ".mp4"
+        if "ogg" in content_type:
+            return ".ogg"
+        if "wav" in content_type:
+            return ".wav"
+        return ".webm"
+
+    # Chunked recordings: the app starts one, uploads a piece every few seconds while you talk,
+    # then finishes it. Each piece is stored as it arrives.
+
+    @app.post("/api/recordings/start", dependencies=[Depends(require_login)])
+    def start_recording(body: RecordingStartIn):
+        entry = store.add_entry(body.date, "", None, None, None, status="recording",
+                                wanted_provider=body.provider or "")
+        audio_store.begin(entry["id"], audio_suffix(body.mime))
+        return entry
+
+    def recording_entry(entry_id: int) -> dict:
+        entry = store.get_entry(entry_id)
+        if not entry:
+            raise HTTPException(404, "Recording not found")
+        if entry["status"] != "recording":
+            raise HTTPException(409, "This recording has already been finished.")
+        return entry
+
+    @app.put("/api/recordings/{entry_id}/chunks/{seq}", dependencies=[Depends(require_login)])
+    async def upload_chunk(entry_id: int, seq: int, request: Request):
+        recording_entry(entry_id)
+        if not 0 <= seq < 100_000:
+            raise HTTPException(400, "Bad chunk number")
+        data = await request.body()
+        if len(data) > MAX_CHUNK_BYTES:
+            raise HTTPException(413, "Chunk is too large.")
+        if data:
+            audio_store.save_chunk(entry_id, seq, data)  # re-sending the same chunk just overwrites it
+        return {"ok": True, "seq": seq}
+
+    @app.post("/api/recordings/{entry_id}/finish", status_code=202, dependencies=[Depends(require_login)])
+    def finish_recording(entry_id: int, body: RecordingFinishIn):
+        recording_entry(entry_id)
+        have = set(audio_store.chunk_numbers(entry_id))
+        missing = [n for n in range(body.chunks) if n not in have]
+        if missing and not body.partial:
+            raise HTTPException(409, {"message": "Some pieces haven't arrived yet.", "missing": missing})
+        return worker.finish_recording(entry_id)
+
     @app.post("/api/recordings", status_code=202, dependencies=[Depends(require_login)])
     def upload_recording(audio: UploadFile = File(...), date: str = Form(...), provider: str | None = Form(None)):
         """Store a recording and return straight away; it's transcribed and summarised in the background."""
@@ -373,14 +439,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             raise HTTPException(413, "Recording is too large.")
         if not data:
             raise HTTPException(400, "Empty recording.")
-        content_type = (audio.content_type or "").lower()
-        suffix = ".webm"
-        if any(t in content_type for t in ("mp4", "m4a", "aac")):
-            suffix = ".mp4"
-        elif "ogg" in content_type:
-            suffix = ".ogg"
-        elif "wav" in content_type:
-            suffix = ".wav"
+        suffix = audio_suffix(audio.content_type)
         entry = store.add_entry(date, "", None, None, None, status="transcribing", wanted_provider=provider or "")
         audio_store.save(entry["id"], data, suffix)
         worker.enqueue(entry["id"])

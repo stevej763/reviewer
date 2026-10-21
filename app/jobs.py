@@ -15,12 +15,16 @@ import json
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 from .crypto import Box
 from .db import Store
 from .llm import Cancelled, Provider, ProviderError
+
+# A recording that hasn't sent a chunk for this long is treated as interrupted.
+SALVAGE_AFTER_SECONDS = 10 * 60
 
 CANCELLED_MESSAGE = "Summary cancelled. Your text is saved; try again whenever you like."
 
@@ -57,6 +61,63 @@ class AudioStore:
 
     def delete(self, entry_id: int) -> None:
         self._path(entry_id).unlink(missing_ok=True)
+        self.discard_chunks(entry_id)
+
+    # A recording in progress arrives as numbered chunks, each stored (encrypted) as it lands,
+    # so whatever has been uploaded survives a closed tab, a locked phone or a dropped connection.
+
+    def _chunk_dir(self, entry_id: int) -> Path:
+        return self.root / f"{entry_id}.chunks"
+
+    def begin(self, entry_id: int, suffix: str) -> None:
+        folder = self._chunk_dir(entry_id)
+        folder.mkdir(mode=0o700, exist_ok=True)
+        (folder / "format").write_text(suffix)
+
+    def chunk_format(self, entry_id: int) -> str:
+        path = self._chunk_dir(entry_id) / "format"
+        return path.read_text().strip() if path.exists() else ".webm"
+
+    def save_chunk(self, entry_id: int, seq: int, data: bytes) -> None:
+        folder = self._chunk_dir(entry_id)
+        folder.mkdir(mode=0o700, exist_ok=True)
+        tmp = folder / f"{seq:06d}.tmp"
+        tmp.write_bytes(self._box.seal_bytes(data))
+        tmp.chmod(0o600)
+        tmp.replace(folder / f"{seq:06d}.part")  # atomic, so a half-written chunk never counts
+
+    def chunk_numbers(self, entry_id: int) -> list[int]:
+        folder = self._chunk_dir(entry_id)
+        if not folder.exists():
+            return []
+        return sorted(int(p.stem) for p in folder.glob("*.part"))
+
+    def last_chunk_time(self, entry_id: int) -> float | None:
+        folder = self._chunk_dir(entry_id)
+        if not folder.exists():
+            return None
+        times = [p.stat().st_mtime for p in folder.glob("*.part")]
+        return max(times) if times else folder.stat().st_mtime
+
+    def assemble(self, entry_id: int, suffix: str | None = None) -> int:
+        """Join the chunks (in order, stopping at the first gap) into one recording. Returns bytes kept."""
+        folder = self._chunk_dir(entry_id)
+        data = bytearray()
+        for expected, seq in enumerate(self.chunk_numbers(entry_id)):
+            if seq != expected:
+                break  # MediaRecorder chunks only decode in order, so later ones are unusable
+            data += self._box.open_bytes((folder / f"{seq:06d}.part").read_bytes())
+        if data:
+            self.save(entry_id, bytes(data), suffix or self.chunk_format(entry_id))
+        self.discard_chunks(entry_id)
+        return len(data)
+
+    def discard_chunks(self, entry_id: int) -> None:
+        folder = self._chunk_dir(entry_id)
+        if folder.exists():
+            for p in folder.iterdir():
+                p.unlink(missing_ok=True)
+            folder.rmdir()
 
 
 def day_entries(store: Store, entry_date: str) -> tuple[list[dict], str]:
@@ -82,6 +143,7 @@ class Worker:
         self._cancelled: set[tuple[str, int | str]] = set()
         self._current: tuple[str, int | str] | None = None
         self._cancel_event = threading.Event()
+        self._finish_lock = threading.Lock()
         self._progress: dict[int, float] = {}  # entry id -> transcription progress (in memory only)
 
     def start(self) -> None:
@@ -91,6 +153,42 @@ class Worker:
             self.enqueue_day(day)
         self._thread = threading.Thread(target=self._loop, name="reviewer-worker", daemon=True)
         self._thread.start()
+        threading.Thread(target=self._salvage_loop, name="reviewer-salvage", daemon=True).start()
+
+    def _salvage_loop(self) -> None:
+        while True:
+            try:
+                self.salvage_interrupted()
+            except Exception:
+                log.exception("salvaging interrupted recordings failed")
+            time.sleep(60)
+
+    def finish_recording(self, entry_id: int) -> dict:
+        """Join a chunked recording's uploaded pieces and queue it for transcription."""
+        with self._finish_lock:  # the app finishing and the salvage sweep can race
+            entry = self._store.get_entry(entry_id)
+            if not entry or entry["status"] != "recording":
+                return entry
+            kept = self._audio.assemble(entry_id)
+            if kept:
+                self._store.set_status(entry_id, "transcribing")
+            else:
+                self._store.set_status(entry_id, "failed",
+                                       "The recording stopped before any audio reached the server.")
+        if kept:
+            self.enqueue(entry_id)
+        return self._store.get_entry(entry_id)
+
+    def salvage_interrupted(self, idle_seconds: int = SALVAGE_AFTER_SECONDS) -> list[int]:
+        """Recordings whose upload stopped (tab closed, phone locked, connection lost) and never
+        finished: transcribe whatever arrived, so nothing that reached the server is lost."""
+        salvaged = []
+        for entry_id in self._store.entry_ids_with_status("recording"):
+            last = self._audio.last_chunk_time(entry_id)
+            if last is None or time.time() - last >= idle_seconds:
+                self.finish_recording(entry_id)
+                salvaged.append(entry_id)
+        return salvaged
 
     def enqueue(self, entry_id: int) -> None:
         with self._lock:

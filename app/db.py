@@ -155,6 +155,11 @@ class Store:
                 "UPDATE entries SET status=?, error=?, wanted_provider=COALESCE(?, wanted_provider) WHERE id=?",
                 (status, error, wanted_provider, entry_id))
 
+    def entry_ids_with_status(self, status: str) -> list[int]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT id FROM entries WHERE status=? ORDER BY id", (status,)).fetchall()
+        return [r["id"] for r in rows]
+
     def pending_entry_ids(self) -> list[int]:
         with self._conn() as conn:
             rows = conn.execute("SELECT id FROM entries WHERE status IN ('transcribing', 'summarising') "
