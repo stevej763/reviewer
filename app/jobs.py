@@ -22,6 +22,7 @@ from pathlib import Path
 from .crypto import Box
 from .db import Store
 from .llm import Cancelled, Provider, ProviderError
+from .timing import Timings
 
 # A recording that hasn't sent a chunk for this long is treated as interrupted.
 SALVAGE_AFTER_SECONDS = 10 * 60
@@ -129,8 +130,13 @@ def day_entries(store: Store, entry_date: str) -> tuple[list[dict], str]:
 
 class Worker:
     def __init__(self, store: Store, audio: AudioStore, transcribe: Callable[[bytes, str], str],
-                 pick_provider: Callable[[str | None], Provider], about_me: Callable[[], str]):
+                 pick_provider: Callable[[str | None], Provider], about_me: Callable[[], str],
+                 speech_model: Callable[[], str] = lambda: "small"):
         self._store = store
+        self._speech_model = speech_model
+        self.timings = Timings(store)
+        # The job being worked on now, for time-left estimates: key, start time, estimated seconds.
+        self._running: dict | None = None
         self._audio = audio
         self._transcribe = transcribe
         self._pick_provider = pick_provider
@@ -204,6 +210,28 @@ class Worker:
             self._queued_days.add(entry_date)
         self._queue.put(("day", entry_date))
 
+    def _begin(self, kind: str, key, estimate: float | None) -> None:
+        self._running = {"key": (kind, key), "started": time.monotonic(), "estimate": estimate}
+
+    def _end(self, timing_kind: str, model: str, size: float) -> None:
+        running, self._running = self._running, None
+        if running:
+            self.timings.record(timing_kind, model, size, time.monotonic() - running["started"])
+
+    def eta(self, kind: str, key) -> int | None:
+        """Estimated seconds left for the job running now, or None if it isn't running.
+        0 means it's taking longer than estimated."""
+        running = self._running
+        if not running or running["key"] != (kind, key) or running["estimate"] is None:
+            return None
+        elapsed = time.monotonic() - running["started"]
+        fraction = self._progress.get(key) if kind == "entry" else None
+        if fraction and fraction > 0.1 and elapsed > 5:
+            remaining = elapsed / fraction - elapsed  # transcription: extrapolate from real progress
+        else:
+            remaining = running["estimate"] - elapsed
+        return max(0, round(remaining))  # 0 = running over the estimate
+
     def progress(self, entry_id: int) -> float | None:
         """How far through transcription a recording is, or None if it isn't being transcribed now."""
         return self._progress.get(entry_id)
@@ -269,13 +297,19 @@ class Worker:
             self._store.delete_day(entry_date)  # a single entry is its own summary
             return
         self._store.save_day(entry_date, status="summarising", entry_count=len(entries))
+        size = self.timings.summary_size("".join(e["text"] for e in entries))
         try:
             provider = self._pick_provider(None)
+            model = f"{provider.name}:{provider.model}"
+            self._begin("day", entry_date, self.timings.estimate("summary", model, size))
             summary = provider.summarize_day(entries, entry_date, self._about_me(), cancel=self._cancel_event)
+            self._end("summary", model, size)
         except Cancelled:
+            self._running = None
             self._day_cancelled(entry_date, previous)
             return
         except Exception as exc:
+            self._running = None
             detail = getattr(exc, "detail", None) or str(exc) or exc.__class__.__name__
             log.warning("end-of-day summary for %s failed: %s", entry_date, detail)
             self._store.save_day(entry_date, status="failed", error=detail)
@@ -295,13 +329,28 @@ class Worker:
                 self._store.set_status(entry_id, "failed", "The recording is missing, so it can't be transcribed.")
                 return
             self._progress[entry_id] = 0.0
+            speech_model = self._speech_model()
+            duration = {}
+
+            def on_progress(fraction: float, seconds: float | None = None):
+                # The first call comes once the model is loaded and the audio length is known,
+                # so model download/loading time doesn't skew the timing history.
+                if seconds and "audio" not in duration:
+                    duration["audio"] = seconds
+                    self._begin("entry", entry_id, self.timings.estimate("transcribe", speech_model, seconds))
+                self._progress[entry_id] = fraction
+
             try:
-                text = self._transcribe(*audio, on_progress=lambda f: self._progress.__setitem__(entry_id, f))
+                text = self._transcribe(*audio, on_progress=on_progress)
+                if duration:
+                    self._end("transcribe", speech_model, duration["audio"])
             except Exception as exc:
                 log.exception("transcription failed")
                 self._store.set_status(entry_id, "failed", f"Transcription failed: {exc}")
                 return
             finally:
+                if self._running and self._running["key"] == ("entry", entry_id):
+                    self._running = None
                 self._progress.pop(entry_id, None)
             if not text.strip():
                 self._store.set_status(entry_id, "failed", "No speech was picked up in that recording.")
@@ -316,10 +365,14 @@ class Worker:
             if self._is_cancelled("entry", entry_id):
                 self._store.set_status(entry_id, "failed", CANCELLED_MESSAGE)
                 return
+            size = self.timings.summary_size(entry["text"])
             try:
                 provider = self._pick_provider(entry["wanted_provider"])
+                model = f"{provider.name}:{provider.model}"
+                self._begin("entry", entry_id, self.timings.estimate("summary", model, size))
                 summary = provider.summarize(entry["text"], entry["date"], self._about_me(),
                                              cancel=self._cancel_event)
+                self._end("summary", model, size)
             except Cancelled:
                 self._store.set_status(entry_id, "failed", CANCELLED_MESSAGE)
                 return
@@ -331,5 +384,8 @@ class Worker:
                 log.exception("summary failed")
                 self._store.set_status(entry_id, "failed", f"Summary failed: {detail}")
                 return
+            finally:
+                if self._running and self._running["key"] == ("entry", entry_id):
+                    self._running = None
             self._store.update_entry(entry_id, summary=summary, provider=provider.name, model=provider.model)
             self._store.set_status(entry_id, "done")

@@ -542,3 +542,29 @@ def test_interrupted_recording_is_salvaged(make_client):
     empty = c.post("/api/recordings/start", json={"date": "2026-10-21"}).json()["id"]
     worker.salvage_interrupted(idle_seconds=0)
     assert entry(c, empty)["status"] == "failed"
+
+
+
+def test_timings_learn_from_history(make_client):
+    c, _ = make_client()
+    t = c.app.state.worker.timings
+    assert t.estimate("transcribe", "small", 100) == 75  # default 0.75 s per audio second
+    for secs in (30, 40, 50):  # this machine is faster than the default
+        t.record("transcribe", "small", 100, secs)
+    assert t.estimate("transcribe", "small", 200) == 80  # median 0.4 s/s
+    assert t.estimate("transcribe", "medium", 100) == 200  # other models keep their own default
+
+
+def test_eta_while_running(make_client):
+    c, _ = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    w = c.app.state.worker
+    w._begin("entry", 7, 60)
+    assert 55 <= w.eta("entry", 7) <= 60
+    assert w.eta("entry", 8) is None and w.eta("day", "2026-10-21") is None
+    w._running["started"] -= 20  # 20s in, transcription 80% through: real progress wins
+    w._progress[7] = 0.8
+    assert w.eta("entry", 7) == 5
+    w._end("transcribe", "small", 100)
+    assert w.eta("entry", 7) is None
+    assert round(w.timings.estimate("transcribe", "small", 100)) == 20

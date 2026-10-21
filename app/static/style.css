@@ -280,3 +280,4 @@ details pre { white-space: pre-wrap; font: inherit; font-size: .92rem; margin: .
 .progress-row { display: flex; align-items: center; gap: 8px; }
 .progress-row .progress { flex: 1; }
 .progress-label { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+.eta-label { font-weight: 400; }

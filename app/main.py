@@ -367,6 +367,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             model_name=config.get()["speech"]["model"], on_progress=on_progress),
         pick_provider=pick_provider,
         about_me=me,
+        speech_model=lambda: config.get()["speech"]["model"],
     )
     if background:
         worker.start()
@@ -450,6 +451,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     def with_progress(entry: dict) -> dict:
         if entry["status"] == "transcribing":
             entry["progress"] = worker.progress(entry["id"])  # None = waiting its turn / loading model
+        if entry["status"] in ("transcribing", "summarising"):
+            entry["eta_seconds"] = worker.eta("entry", entry["id"])  # None = not started yet
         return entry
 
     @app.get("/api/entries", dependencies=[Depends(require_login)])
@@ -529,6 +532,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     def _day_out(day: dict) -> dict:
         out = {k: v for k, v in day.items() if k != "fingerprint"}
+        if day["status"] == "summarising":
+            out["eta_seconds"] = worker.eta("day", day["date"])
         # Stale = entries were added, edited or removed since it was written.
         out["stale"] = day["status"] == "done" and day_entries(store, day["date"])[1] != day["fingerprint"]
         return out

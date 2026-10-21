@@ -375,7 +375,8 @@ function renderDay(day, date, entryCount) {
   }
   if (busyNow) {
     card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
-      el("b", {}, day.summary ? "Updating the end-of-day summary…" : "Combining this day's entries…"),
+      el("b", {}, day.summary ? "Updating the end-of-day summary…" : "Combining this day's entries…", " ",
+        etaLabel(day.eta_seconds)),
       el("button", {
         class: "btn small",
         onclick: async (e) => {
@@ -432,7 +433,7 @@ function renderSummary(entry, { onChange } = {}) {
     }, "Cancel") : null;
     const bar = entry.status === "transcribing" ? progressBar(entry.progress) : null;
     card.append(el("div", { class: "processing" }, el("span", { class: "spinner", "aria-hidden": "true" }),
-      el("div", { class: "processing-body" }, el("b", {}, PENDING[entry.status]), bar,
+      el("div", { class: "processing-body" }, el("b", {}, PENDING[entry.status], " ", etaLabel(entry.eta_seconds)), bar,
         el("div", { class: "muted small" }, "Saved safely. You can leave this page; it carries on in the background.")),
       cancel));
     watchPending();
@@ -513,6 +514,20 @@ function renderSummary(entry, { onChange } = {}) {
   return card;
 }
 
+// "about 40s left", from the server's estimate (learned from how long past jobs took).
+function etaText(seconds) {
+  if (seconds == null) return "";
+  if (seconds === 0) return "taking longer than usual…";
+  if (seconds <= 3) return "almost done";
+  if (seconds < 60) return `about ${Math.ceil(seconds / 5) * 5}s left`;
+  const mins = Math.round(seconds / 60);
+  return `about ${mins} min left`;
+}
+
+function etaLabel(seconds) {
+  return el("span", { class: "muted small eta-label" }, etaText(seconds));
+}
+
 // Transcription progress: how far through the recording Whisper has got.
 function progressBar(fraction) {
   const fill = el("div");
@@ -550,6 +565,10 @@ function watchPending() {
         try {
           const day = await api(`/api/days/${card.dataset.day}`);
           if (day.status !== card.dataset.status) card.replaceWith(renderDay(day));
+          else {
+            const eta = card.querySelector(".eta-label");
+            if (eta) eta.textContent = etaText(day.eta_seconds);
+          }
         } catch {
           // Cancelled before it was ever written: back to the "create" card.
           const date = card.dataset.day;
@@ -563,6 +582,8 @@ function watchPending() {
         const entry = await api(`/api/entries/${card.dataset.entryId}`);
         const bar = card.querySelector(".progress-row");
         if (entry.status === card.dataset.status && bar) setProgress(bar, entry.progress);
+        const eta = card.querySelector(".eta-label");
+        if (entry.status === card.dataset.status && eta) eta.textContent = etaText(entry.eta_seconds);
         if (entry.status !== card.dataset.status) {
           card.replaceWith(renderSummary(entry, card._opts));
           entryFinished = true;

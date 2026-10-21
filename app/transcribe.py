@@ -44,7 +44,8 @@ class Transcriber:
 
     def transcribe(self, audio: bytes, suffix: str = ".webm", language: str | None = None,
                    model_name: str | None = None, on_progress=None) -> str:
-        """`on_progress(fraction)` is called as each segment is transcribed (0.0 to 1.0)."""
+        """`on_progress(fraction, audio_seconds)` is called once decoding starts, then as each
+        segment is transcribed (fraction 0.0 to 1.0)."""
         model = self._load(model_name)
         # PyAV (bundled with faster-whisper) decodes webm/opus from Chrome and mp4/aac from Safari.
         with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
@@ -59,8 +60,10 @@ class Transcriber:
             # Segments are produced lazily as decoding goes, each with an end time in the
             # recording, so how far through the recording we are is progress.
             texts = []
+            if on_progress:
+                on_progress(0.0, info.duration)
             for seg in segments:
                 texts.append(seg.text.strip())
                 if on_progress and info.duration:
-                    on_progress(min(seg.end / info.duration, 1.0))
+                    on_progress(min(seg.end / info.duration, 1.0), info.duration)
             return " ".join(texts).strip()
