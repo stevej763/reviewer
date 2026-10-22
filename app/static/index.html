@@ -203,8 +203,8 @@
         <h2>Load a backup</h2>
         <p class="muted small">Adds the entries, end-of-day summaries and reports from a backup. Anything already here is kept, and your PIN and AI settings don't change.</p>
         <label>Backup file <input id="import-file" type="file" accept=".json,application/json"></label>
-        <label>Startup password, recovery key or encryption key of the app that made it <input id="import-key" type="password" autocomplete="off" spellcheck="false"></label>
-        <p class="muted small">Leave it empty if the backup came from this app. Older backups (made before startup passwords) need the encryption key.</p>
+        <label>Startup password or recovery key of the app that made it <input id="import-key" type="password" autocomplete="off" spellcheck="false"></label>
+        <p class="muted small">Leave it empty if the backup came from this app.</p>
         <div class="actions"><button id="import-backup" class="btn">Load backup</button></div>
         <p id="import-result" class="muted small" role="status"></p>
         <p id="import-error" class="error" role="alert"></p>

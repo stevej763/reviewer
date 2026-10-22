@@ -114,9 +114,8 @@ Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), `
   the backup was made). Because the wrapped key travels with the backup, a stolen backup is only
   as safe as your password, so pick a good one.
 - **Load a backup** on the same screen adds the entries, end-of-day summaries and reports from a
-  backup, given the startup password, recovery key or encryption key of the app that made it
-  (leave it empty for this app's own backups). Backups made before startup passwords existed
-  need the encryption key.
+  backup, given the startup password or recovery key of the app that made it (leave it empty
+  for this app's own backups). Backups made before startup passwords can't be loaded.
   That's how you move from the server to the Mac app or back. Nothing already there is
   replaced, loading the same backup twice adds nothing, and your PIN and AI settings stay as they are.
 - **History → Export CSV** gives a spreadsheet of every highlight.
