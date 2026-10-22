@@ -26,8 +26,18 @@
         <input id="pin" type="password" inputmode="numeric" autocomplete="current-password"
                aria-label="PIN" placeholder="••••" maxlength="64" required>
         <button class="btn primary wide" type="submit">Unlock</button>
+        <button class="btn wide" type="button" id="touch-id-login" hidden>Use Touch ID</button>
       </form>
       <p id="login-error" class="error" role="alert"></p>
+    </div>
+  </main>
+
+  <!-- Startup password: create it, unlock with it, or recover with the recovery key -->
+  <main id="vault" class="login" hidden>
+    <div class="login-card vault-card">
+      <img class="brand-mark" src="/static/icon.svg" alt="">
+      <h1 id="vault-title">Brain Dump</h1>
+      <div id="vault-body"></div>
     </div>
   </main>
 
@@ -167,9 +177,34 @@
         <p class="muted small">Changing your PIN signs out your other devices.</p>
         <p id="pin-error" class="error" role="alert"></p>
       </div>
+      <div class="card" id="password-card">
+        <h2>Startup password</h2>
+        <div id="password-change">
+          <p class="muted small">Typed once each time Brain Dump starts, to unlock your data. Changing it doesn't re-encrypt anything, and your recovery key keeps working.</p>
+          <label>Current password <input id="pw-current" type="password" autocomplete="current-password"></label>
+          <label>New password <input id="pw-new" type="password" autocomplete="new-password"></label>
+          <p id="pw-strength" class="strength"></p>
+          <div class="actions">
+            <button id="pw-suggest" class="btn small" type="button">Suggest a passphrase</button>
+            <button id="change-password" class="btn">Change password</button>
+          </div>
+          <p id="pw-error" class="error" role="alert"></p>
+        </div>
+        <div id="password-enable" hidden>
+          <p class="muted small">Your encryption key is set with SECRET_KEY, so Brain Dump starts unlocked. Set a startup password to keep the key locked away instead; then remove SECRET_KEY from your settings.</p>
+          <label>PIN <input id="pw-enable-pin" type="password" inputmode="numeric" autocomplete="current-password"></label>
+          <label>New password <input id="pw-enable-new" type="password" autocomplete="new-password"></label>
+          <div class="actions">
+            <button id="pw-enable-suggest" class="btn small" type="button">Suggest a passphrase</button>
+            <button id="enable-password" class="btn">Set startup password</button>
+          </div>
+          <div id="pw-enable-recovery" hidden></div>
+          <p id="pw-enable-error" class="error" role="alert"></p>
+        </div>
+      </div>
       <div class="card">
         <h2>Your data</h2>
-        <p class="muted small">Everything is stored encrypted on this machine. The backup stays encrypted too, so keep your encryption key somewhere safe: without it the backup can't be opened.</p>
+        <p class="muted small">Everything is stored encrypted on this machine. The backup stays encrypted too: it opens with your startup password or recovery key (or the encryption key below), so keep those somewhere safe.</p>
         <div class="exports">
           <a class="btn small" href="/api/export/backup.json">Download backup</a>
           <a class="btn small" href="/api/export/highlights.csv">All highlights (CSV)</a>
@@ -177,9 +212,10 @@
       </div>
       <div class="card">
         <h2>Encryption key</h2>
-        <p class="muted small">You need this key to load a backup from this app somewhere else, such as moving from your server to the Mac app.</p>
+        <p class="muted small">The key that actually encrypts your data. Older backups need it to be loaded somewhere else; newer ones open with your startup password or recovery key instead.</p>
         <div class="grid2">
           <label>PIN <input id="key-pin" type="password" inputmode="numeric" autocomplete="current-password"></label>
+          <label id="key-password-field">Startup password <input id="key-password" type="password" autocomplete="current-password"></label>
         </div>
         <div class="actions"><button id="show-key" class="btn">Show key</button></div>
         <div id="key-box" hidden>
@@ -192,8 +228,8 @@
         <h2>Load a backup</h2>
         <p class="muted small">Adds the entries, end-of-day summaries and reports from a backup. Anything already here is kept, and your PIN and AI settings don't change.</p>
         <label>Backup file <input id="import-file" type="file" accept=".json,application/json"></label>
-        <label>Encryption key of the app that made it <input id="import-key" type="password" autocomplete="off" spellcheck="false"></label>
-        <p class="muted small">Leave the key empty if the backup came from this app.</p>
+        <label>Startup password, recovery key or encryption key of the app that made it <input id="import-key" type="password" autocomplete="off" spellcheck="false"></label>
+        <p class="muted small">Leave it empty if the backup came from this app. Older backups (made before startup passwords) need the encryption key.</p>
         <div class="actions"><button id="import-backup" class="btn">Load backup</button></div>
         <p id="import-result" class="muted small" role="status"></p>
         <p id="import-error" class="error" role="alert"></p>

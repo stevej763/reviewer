@@ -654,3 +654,265 @@ def test_double_encoded_summaries_still_read(client):
         conn.execute("UPDATE entries SET summary=? WHERE id=?", (store.box.seal(json.dumps(json.dumps(e["summary"]))),
                                                                  e["id"]))
     assert entry(client, e["id"])["summary"] == e["summary"]
+
+
+# ---- startup password -------------------------------------------------------
+
+PASSWORD = "maple-rocket-violin-harbor"
+
+
+@pytest.fixture
+def fast_kdf(monkeypatch):
+    import app.vault
+    monkeypatch.setattr(app.vault, "SCRYPT_N", 2**10)  # the real cost is checked in test_keyring_file
+
+
+@pytest.fixture
+def make_locked(tmp_path, monkeypatch, fast_kdf):
+    """An app without SECRET_KEY, so it starts locked behind the startup password."""
+    def _make(data_dir=None, secret=None):
+        monkeypatch.setenv("DATA_DIR", str(data_dir or tmp_path))
+        if secret:
+            monkeypatch.setenv("SECRET_KEY", secret)
+        else:
+            monkeypatch.delenv("SECRET_KEY", raising=False)
+        app = create_app(load_settings(), providers={"claude": FakeProvider()}, transcriber=FakeTranscriber(),
+                         background=False)
+        return DrainingClient(app)
+    return _make
+
+
+def first_run(c):
+    """Create the password and do the normal setup; returns the recovery key."""
+    r = c.post("/api/vault/setup", json={"password": PASSWORD})
+    assert r.status_code == 200, r.text
+    assert c.post("/api/setup", json=SETUP).status_code == 200
+    return r.json()["recovery_key"]
+
+
+def test_password_rules():
+    from app.vault import password_problem, suggest_passphrase
+    for weak in ("short", "aaaaaaaaaaaaaaaa", "password1234", "qwertyuiop12", "123456789012", "P@ssw0rd2026!",
+                 "abcdefghijklmnop", "braindump2026", " leading-space-here"):
+        assert password_problem(weak), weak
+    for good in (PASSWORD, "correct horse battery staple", "Tr0ub4dor&3-xylophone"):
+        assert password_problem(good) is None, good
+    words = suggest_passphrase().split("-")
+    assert len(words) == 5 and all(w.isalpha() for w in words)
+    assert password_problem("-".join(words)) is None
+
+
+def test_keyring_file(tmp_path):
+    from app.vault import LOCKED, SCRYPT_N, SETUP, Vault, WrongSecret
+    v = Vault(tmp_path)
+    assert v.state == SETUP and not v.unlocked
+    with pytest.raises(ValueError):
+        v.create_password("too-short")
+    recovery = v.create_password(PASSWORD)
+    dek = v.dek
+    raw = (tmp_path / "keyring.json").read_text()
+    assert dek not in raw and PASSWORD not in raw and recovery not in raw
+    assert json.loads(raw)["slots"]["password"]["n"] == SCRYPT_N == 2**17
+    assert oct((tmp_path / "keyring.json").stat().st_mode)[-3:] == "600"
+
+    v2 = Vault(tmp_path)
+    assert v2.state == LOCKED
+    with pytest.raises(WrongSecret):
+        v2.unlock("not-the-password-at-all")
+    v2.unlock(recovery.lower().replace("-", " "))  # typed loosely
+    assert v2.dek == dek
+
+
+def test_new_install_starts_locked(make_locked, tmp_path):
+    c = make_locked()
+    assert c.get("/api/session").status_code == 423
+    assert c.get("/api/entries").status_code == 423
+    assert c.get("/healthz").status_code == 200 and c.get("/static/app.js").status_code == 200
+    v = c.get("/api/vault").json()
+    assert v["state"] == "setup" and not v["password"] and not v["pin_required"]
+    assert c.post("/api/vault/unlock", json={"password": PASSWORD}).status_code == 409
+    assert c.post("/api/vault/setup", json={"password": "password12345"}).status_code == 400
+    assert c.post("/api/vault/check", json={"password": "short"}).json()["problem"]
+    assert len(c.get("/api/vault/suggest").json()["passphrase"].split("-")) == 5
+
+    recovery = first_run(c)
+    assert len(recovery) == 29
+    assert c.post("/api/vault/setup", json={"password": PASSWORD}).status_code == 409  # only once
+    eid = c.post("/api/entries", json={"date": "2026-10-19", "text": "Shipped Apollo"}).json()["id"]
+    assert not (tmp_path / ".secret_key").exists()
+
+    # Restart: locked again. The old session cookie works once unlocked (cookies are signed
+    # with a key from the data key, so they survive restarts).
+    c2 = make_locked()
+    c2.cookies = c.cookies
+    assert c2.get("/api/vault").json()["state"] == "locked"
+    assert c2.get(f"/api/entries/{eid}").status_code == 423
+    assert c2.post("/api/vault/unlock", json={"password": "wrong-password-here"}).status_code == 400
+    assert c2.post("/api/vault/unlock", json={"password": PASSWORD}).status_code == 200
+    assert c2.get(f"/api/entries/{eid}").json()["text"] == "Shipped Apollo"
+
+
+def test_unlock_attempts_are_limited(make_locked):
+    first_run(make_locked())
+    c = make_locked()
+    codes = [c.post("/api/vault/unlock", json={"password": f"wrong-guess-{i}-xyz"}).status_code for i in range(5)]
+    assert codes == [400, 400, 400, 400, 429]
+    assert c.post("/api/vault/unlock", json={"password": PASSWORD}).status_code == 429  # even the right one
+    assert c.get("/api/vault").json()["locked_for"] > 0
+
+
+def test_pending_work_resumes_after_unlock(make_locked):
+    c = make_locked()
+    first_run(c)
+    r = TestClient.request(c, "POST", "/api/recordings", data={"date": "2026-10-19"},
+                           files={"audio": ("r.webm", b"abc", "audio/webm")})
+    eid = r.json()["id"]
+    c2 = make_locked()
+    assert c2.app.state.worker._queue.empty()  # nothing runs while locked
+    c2.post("/api/vault/unlock", json={"password": PASSWORD})
+    assert c2.app.state.store.get_entry(eid)["status"] == "done"
+
+
+def test_migrates_old_secret_key_file(make_locked, tmp_path):
+    # An older install: data encrypted with a key kept in plain text in .secret_key.
+    old = make_locked(secret="legacy-key-from-file")
+    assert old.post("/api/setup", json=SETUP).status_code == 200
+    old.post("/api/entries", json={"date": "2026-10-19", "text": "Before the password"})
+    (tmp_path / ".secret_key").write_text("legacy-key-from-file\n")
+
+    c = make_locked()
+    v = c.get("/api/vault").json()
+    assert v["state"] == "migrate" and v["pin_required"]
+    assert c.get("/api/entries").status_code == 423
+    assert c.post("/api/vault/setup", json={"password": PASSWORD}).status_code == 400  # PIN needed
+    assert c.post("/api/vault/setup", json={"password": PASSWORD, "pin": "000000"}).status_code == 400
+    r = c.post("/api/vault/setup", json={"password": PASSWORD, "pin": PIN})
+    assert r.status_code == 200 and r.json()["recovery_key"]
+    assert not (tmp_path / ".secret_key").exists()
+    assert c.get("/api/entries").json()[0]["text"] == "Before the password"  # signed in by the PIN
+
+    c2 = make_locked()
+    c2.post("/api/vault/unlock", json={"password": PASSWORD})
+    c2.post("/api/login", json={"pin": PIN})
+    assert c2.get("/api/entries").json()[0]["text"] == "Before the password"  # nothing re-encrypted
+    assert c2.post("/api/settings/key", json={"pin": PIN}).status_code == 400  # password needed too
+    key = c2.post("/api/settings/key", json={"pin": PIN, "password": PASSWORD}).json()["key"]
+    assert key == "legacy-key-from-file"
+
+
+def test_secret_key_env_can_add_a_password(make_locked):
+    c = make_locked(secret="env-key")
+    assert c.post("/api/setup", json=SETUP).status_code == 200
+    v = c.get("/api/vault").json()
+    assert v["state"] == "unlocked" and v["from_env"] and not v["password"]
+    c.cookies.clear()
+    assert c.post("/api/vault/setup", json={"password": PASSWORD, "pin": PIN}).status_code == 401  # sign in first
+    c.post("/api/login", json={"pin": PIN})
+    assert c.post("/api/vault/setup", json={"password": PASSWORD, "pin": "000000"}).status_code == 400
+    assert c.post("/api/vault/setup", json={"password": PASSWORD, "pin": PIN}).status_code == 200
+    # The keyring wins over SECRET_KEY from now on.
+    c2 = make_locked(secret="env-key")
+    assert c2.get("/api/vault").json()["state"] == "locked"
+    c2.post("/api/vault/unlock", json={"password": PASSWORD})
+    assert c2.app.state.vault.dek == "env-key"
+
+
+def test_change_and_recover_password(make_locked):
+    c = make_locked()
+    recovery = first_run(c)
+    new = "lantern-quartz-meadow-tiger"
+    assert c.post("/api/settings/password", json={"current": "wrong-password-x", "new": new}).status_code == 400
+    assert c.post("/api/settings/password", json={"current": PASSWORD, "new": "short"}).status_code == 400
+    assert c.post("/api/settings/password", json={"current": PASSWORD, "new": new}).status_code == 200
+
+    c2 = make_locked()
+    assert c2.post("/api/vault/unlock", json={"password": PASSWORD}).status_code == 400
+    assert c2.post("/api/vault/unlock", json={"password": new}).status_code == 200
+
+    c3 = make_locked()  # forgot it: the recovery key unlocks and sets a new one
+    newer = "orbit-saddle-pepper-glacier"
+    assert c3.post("/api/vault/recover", json={"recovery_key": "AAAAA-AAAAA-AAAAA-AAAAA-AAAAA",
+                                               "new_password": newer}).status_code == 400
+    assert c3.post("/api/vault/recover", json={"recovery_key": recovery, "new_password": newer}).status_code == 200
+    assert c3.get("/api/vault").json()["state"] == "unlocked"
+    c4 = make_locked()
+    assert c4.post("/api/vault/unlock", json={"password": newer}).status_code == 200
+
+
+def test_backup_v2_opens_with_password_or_recovery_key(make_locked, tmp_path):
+    a = make_locked(tmp_path / "a")
+    recovery = first_run(a)
+    a.post("/api/entries", json={"date": "2026-10-19", "text": "Shipped Apollo"})
+    raw = a.get("/api/export/backup.json").content
+    data = json.loads(raw)
+    assert data["version"] == 2 and set(data["keyring"]["slots"]) == {"password", "recovery"}
+    assert b"Shipped Apollo" not in raw and a.app.state.vault.dek.encode() not in raw
+    # This app's own backup needs nothing typed
+    assert a.post("/api/import/backup", files={"file": ("b.json", raw)}).json()["entries"] == 0
+
+    b = make_locked(tmp_path / "b")
+    first_run(b)
+    files = {"file": ("b.json", raw)}
+    blank = b.post("/api/import/backup", files=files)
+    assert blank.status_code == 400 and "startup password or recovery key" in blank.json()["detail"]
+    assert b.post("/api/import/backup", files=files, data={"key": "not-the-password"}).status_code == 400
+    assert b.post("/api/import/backup", files=files, data={"key": PASSWORD}).json()["entries"] == 1
+    assert b.post("/api/import/backup", files=files, data={"key": recovery}).json()["entries"] == 0  # already in
+    assert "Shipped Apollo" in {e["text"] for e in b.get("/api/entries").json()}
+
+    # The raw encryption key still opens it, and v1 backups (from a SECRET_KEY app) still load.
+    c = make_locked(tmp_path / "c")
+    first_run(c)
+    assert c.post("/api/import/backup", files=files, data={"key": a.app.state.vault.dek}).json()["entries"] == 1
+    old = make_locked(tmp_path / "old", secret="v1-key")
+    old.post("/api/setup", json=SETUP)
+    old.post("/api/entries", json={"date": "2026-10-18", "text": "From a v1 backup"})
+    v1 = old.get("/api/export/backup.json").content
+    assert json.loads(v1)["version"] == 1 and "keyring" not in json.loads(v1)
+    assert c.post("/api/import/backup", files={"file": ("v1.json", v1)}, data={"key": "v1-key"}).json()["entries"] == 1
+
+
+def test_mac_app_channel(make_locked):
+    import io
+    from app.macbridge import MacBridge
+    first_run(make_locked())
+    c = make_locked()
+    out = io.StringIO()
+    bridge = MacBridge(c.app, out)
+    bridge.start()
+
+    def messages():
+        lines = out.getvalue().splitlines()
+        out.seek(0)
+        out.truncate()
+        return [json.loads(line) for line in lines]
+
+    assert messages() == [{"type": "state", "state": "locked", "password": True}]
+    bridge.handle(json.dumps({"type": "get_key"}))
+    assert messages()[0]["type"] == "error"  # no key handed out while locked
+    bridge.handle(json.dumps({"type": "unlock", "key": "wrong"}))
+    assert messages()[0]["for"] == "unlock" and c.get("/api/entries").status_code == 423
+
+    c.post("/api/vault/unlock", json={"password": PASSWORD})  # typed in the page
+    assert messages() == [{"type": "unlocked", "password": True}]
+    bridge.handle(json.dumps({"type": "get_key"}))
+    dek = messages()[0]["key"]
+    assert dek == c.app.state.vault.dek
+
+    # Next launch: the key from the Keychain unlocks without the password.
+    c2 = make_locked()
+    out2 = io.StringIO()
+    bridge2 = MacBridge(c2.app, out2)
+    bridge2.start()
+    bridge2.handle(json.dumps({"type": "unlock", "key": dek}))
+    assert c2.get("/api/vault").json()["state"] == "unlocked"
+    assert c2.get("/api/entries").status_code == 401  # still needs the PIN, or Touch ID:
+    assert c2.post("/api/mac/login", json={"code": "made-up"}).status_code == 401
+    out2.seek(0)
+    out2.truncate()
+    bridge2.handle(json.dumps({"type": "login_code"}))
+    code = json.loads(out2.getvalue())["code"]
+    assert c2.post("/api/mac/login", json={"code": code}).status_code == 200
+    assert c2.get("/api/entries").status_code == 200
+    c2.cookies.clear()
+    assert c2.post("/api/mac/login", json={"code": code}).status_code == 401  # single use

@@ -37,7 +37,11 @@ async function api(path, { method = "GET", body, form } = {}) {
     boot();
     throw new Error((data && data.detail) || "Setup needed");
   }
-  if (res.status === 401 && path !== "/api/login") {
+  if (res.status === 423 && !path.startsWith("/api/vault")) {
+    boot();  // the server restarted and is locked: ask for the startup password
+    throw new Error("Brain Dump is locked.");
+  }
+  if (res.status === 401 && path !== "/api/login" && path !== "/api/mac/login") {
     showLogin();
     throw new Error("Please unlock again.");
   }
@@ -89,12 +93,38 @@ function fillProviders(select) {
 
 // ---------- auth ----------
 
+function showOnly(id) {
+  for (const s of ["#login", "#setup", "#app", "#vault"]) $(s).hidden = s !== id;
+}
+
 function showLogin() {
-  $("#app").hidden = true;
-  $("#login").hidden = false;
+  showOnly("#login");
   $("#pin").value = "";
+  $("#touch-id-login").hidden = !touchIDReady();
   setTimeout(() => $("#pin").focus(), 50);
 }
+
+// ---------- Mac app (Touch ID) ----------
+//
+// Inside the Mac app, Touch ID can unlock the app at startup and stand in for the PIN.
+// The app does the Touch ID check itself and then signs this page in with a single-use code.
+
+const macApp = () => window.webkit?.messageHandlers?.braindump;
+const touchIDReady = () => Boolean(macApp() && window.braindumpMac?.touchID);
+
+window.braindumpMacLogin = async (code) => {
+  try {
+    await api("/api/mac/login", { method: "POST", body: { code } });
+    await boot();
+    return true;
+  } catch (err) {
+    $("#login-error").textContent = err.message;
+    return false;
+  }
+};
+window.braindumpRefresh = () => boot();
+
+$("#touch-id-login").addEventListener("click", () => macApp()?.postMessage({ action: "login" }));
 
 async function refreshSession() {
   const s = await api("/api/session");
@@ -111,12 +141,12 @@ async function refreshSession() {
 }
 
 async function boot() {
+  state.vault = await api("/api/vault");
+  if (state.vault.state !== "unlocked") return showVault(state.vault);
   const s = await refreshSession();
   if (s.setup_required) return showSetup(s.defaults);
   if (!s.authenticated) return showLogin();
-  $("#login").hidden = true;
-  $("#setup").hidden = true;
-  $("#app").hidden = false;
+  showOnly("#app");
   markActive(true);
   $("#rep-style").replaceChildren(...Object.entries(state.styles).map(([k, v]) => el("option", { value: k }, v)));
   showView(location.hash.slice(1) || "log");
@@ -135,6 +165,133 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 $("#logout").addEventListener("click", () => lockApp());
+
+// ---------- startup password ----------
+
+function passwordInputs(onChange) {
+  const pw = input({ type: "password", autocomplete: "new-password", required: true });
+  const pw2 = input({ type: "password", autocomplete: "new-password", required: true });
+  const strength = el("p", { class: "strength", "aria-live": "polite" });
+  let timer;
+  pw.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => checkStrength(pw.value, strength), 300);
+    onChange && onChange();
+  });
+  const suggest = el("button", { type: "button", class: "btn small", onclick: async () => {
+    try {
+      const { passphrase } = await api("/api/vault/suggest");
+      for (const box of [pw, pw2]) { box.type = "text"; box.value = passphrase; }
+      checkStrength(passphrase, strength);
+    } catch (err) { strength.className = "strength bad"; strength.textContent = err.message; }
+  } }, "Suggest a passphrase");
+  return { pw, pw2, strength, suggest };
+}
+
+async function checkStrength(value, line) {
+  if (!value) { line.textContent = ""; return; }
+  try {
+    const { problem } = await api("/api/vault/check", { method: "POST", body: { password: value } });
+    line.className = problem ? "strength bad" : "strength ok";
+    line.textContent = problem || "Looks good.";
+  } catch { /* checked again on submit */ }
+}
+
+function vaultForm(title, intro, fields, button, onSubmit, extra = []) {
+  const error = el("p", { class: "error", role: "alert" });
+  const submit = el("button", { type: "submit", class: "btn primary wide" }, button);
+  const form = el("form", { autocomplete: "off" }, ...fields, el("div", {}, submit), error, ...extra);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    await busy(submit, "One moment…", async () => {
+      try { await onSubmit(); } catch (err) { error.textContent = err.message; }
+    });
+  });
+  $("#vault-title").textContent = title;
+  $("#vault-body").replaceChildren(el("p", { class: "muted" }, intro), form);
+  showOnly("#vault");
+  setTimeout(() => form.querySelector("input")?.focus(), 50);
+}
+
+function showVault(v) {
+  if (v.state === "locked") return showUnlock(v);
+  const migrating = v.state === "migrate";
+  const p = passwordInputs();
+  const pin = input({ type: "password", inputmode: "numeric", autocomplete: "current-password" });
+  const fields = [
+    v.pin_required ? field("Your PIN", pin) : null,
+    field("Startup password", p.pw), p.strength,
+    field("Type it again", p.pw2),
+    el("div", { class: "actions" }, p.suggest),
+    el("p", { class: "muted small" }, "At least 12 characters. A few random words are easy to remember and hard to guess."),
+  ].filter(Boolean);
+  vaultForm(
+    migrating ? "Add a startup password" : "Create a startup password",
+    migrating
+      ? "Brain Dump now keeps your encryption key locked behind a password you type when it starts, instead of in a file next to your data. Nothing is re-encrypted and your entries stay as they are."
+      : "Your data is encrypted with a key that's locked by this password. You'll type it each time Brain Dump starts (or use Touch ID in the Mac app).",
+    fields, migrating ? "Add password" : "Create password",
+    async () => {
+      if (p.pw.value !== p.pw2.value) throw new Error("The passwords don't match.");
+      const r = await api("/api/vault/setup", { method: "POST", body: { password: p.pw.value, pin: pin.value } });
+      showRecovery(r.recovery_key);
+    });
+}
+
+function recoveryBlock(key, onDone) {
+  const saved = el("input", { type: "checkbox" });
+  const done = el("button", { type: "button", class: "btn primary wide", disabled: true }, "Continue");
+  saved.addEventListener("change", () => { done.disabled = !saved.checked; });
+  done.addEventListener("click", onDone);
+  const copy = el("button", { type: "button", class: "btn small", onclick: async () => {
+    try { await navigator.clipboard.writeText(key); toast("Recovery key copied"); } catch { toast("Select the key and copy it"); }
+  } }, "Copy");
+  return el("div", { class: "settings-form" },
+    el("p", { class: "muted small" }, "If you ever forget your startup password, this recovery key is the only other way in. Write it down or save it in a password manager now: it won't be shown again."),
+    el("div", { class: "recovery-key" }, key),
+    el("div", { class: "actions" }, copy),
+    el("label", { class: "check-row" }, saved, "I've saved my recovery key somewhere safe"),
+    done);
+}
+
+function showRecovery(key) {
+  $("#vault-title").textContent = "Your recovery key";
+  $("#vault-body").replaceChildren(recoveryBlock(key, () => boot()));
+  showOnly("#vault");
+}
+
+function showUnlock(v) {
+  const pw = input({ type: "password", autocomplete: "current-password", required: true });
+  const forgot = el("button", { type: "button", class: "link-btn", onclick: showRecover }, "Forgot it? Use your recovery key");
+  const extra = [el("p", {}, forgot)];
+  if (touchIDReady()) {
+    extra.unshift(el("button", { type: "button", class: "btn wide", onclick: () => macApp().postMessage({ action: "unlock" }) },
+      "Use Touch ID"));
+  }
+  vaultForm("Unlock Brain Dump", "Enter your startup password to unlock your data.", [field("Startup password", pw)], "Unlock",
+    async () => {
+      try { await api("/api/vault/unlock", { method: "POST", body: { password: pw.value } }); } catch (err) { pw.value = ""; throw err; }
+      await boot();
+    }, extra);
+  if (v.locked_for) $("#vault-body .error").textContent = "Too many wrong passwords. Wait a little and try again.";
+}
+
+function showRecover() {
+  const key = input({ autocomplete: "off", spellcheck: "false", autocapitalize: "characters", placeholder: "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX", required: true });
+  const p = passwordInputs();
+  const back = el("button", { type: "button", class: "link-btn", onclick: () => boot() }, "Back to the password");
+  vaultForm("Use your recovery key", "Unlock with the recovery key you saved when you created your password, then choose a new password.",
+    [field("Recovery key", key), field("New startup password", p.pw), p.strength, field("Type it again", p.pw2),
+      el("div", { class: "actions" }, p.suggest)],
+    "Unlock and save new password",
+    async () => {
+      if (p.pw.value !== p.pw2.value) throw new Error("The passwords don't match.");
+      await api("/api/vault/recover", { method: "POST", body: { recovery_key: key.value, new_password: p.pw.value } });
+      toast("New password saved");
+      await boot();
+    }, [el("p", {}, back)]);
+}
 
 // ---------- auto-lock ----------
 //
@@ -1094,9 +1251,7 @@ function settingsForm(cfg, { setup = false, onSaved, parts = ["profile", "ai", "
 }
 
 function showSetup(defaults) {
-  $("#login").hidden = true;
-  $("#app").hidden = true;
-  $("#setup").hidden = false;
+  showOnly("#setup");
   $("#setup-form").replaceChildren(settingsForm(defaults, {
     setup: true,
     onSaved: async () => { $("#setup").hidden = true; toast("All set"); await boot(); },
@@ -1117,6 +1272,12 @@ async function loadSettings(tab = settingsTab) {
   $("#settings-form").hidden = settingsTab === "security";
   if (settingsTab === "security") {
     $("#auto-lock").value = String(idle.minutes);
+    try { state.vault = await api("/api/vault"); } catch { /* keep what we had */ }
+    const v = state.vault || {};
+    $("#password-change").hidden = !v.password;
+    $("#password-enable").hidden = v.password || !v.from_env;
+    $("#password-card").hidden = !v.password && !v.from_env;
+    $("#key-password-field").hidden = !v.password;
     return;
   }
   try {
@@ -1141,6 +1302,52 @@ $("#change-pin").addEventListener("click", async (e) => {
   });
 });
 
+let strengthTimer;
+$("#pw-new").addEventListener("input", () => {
+  clearTimeout(strengthTimer);
+  strengthTimer = setTimeout(() => checkStrength($("#pw-new").value, $("#pw-strength")), 300);
+});
+
+async function suggestInto(box) {
+  try {
+    const { passphrase } = await api("/api/vault/suggest");
+    box.type = "text";
+    box.value = passphrase;
+    box.dispatchEvent(new Event("input"));
+  } catch (err) { toast(err.message); }
+}
+$("#pw-suggest").addEventListener("click", () => suggestInto($("#pw-new")));
+$("#pw-enable-suggest").addEventListener("click", () => suggestInto($("#pw-enable-new")));
+
+$("#change-password").addEventListener("click", async (e) => {
+  $("#pw-error").textContent = "";
+  await busy(e.currentTarget, "Changing…", async () => {
+    try {
+      await api("/api/settings/password", { method: "POST", body: { current: $("#pw-current").value, new: $("#pw-new").value } });
+      $("#pw-current").value = "";
+      $("#pw-new").value = "";
+      $("#pw-new").type = "password";
+      $("#pw-strength").textContent = "";
+      toast("Startup password changed");
+    } catch (err) { $("#pw-error").textContent = err.message; }
+  });
+});
+
+$("#enable-password").addEventListener("click", async (e) => {
+  $("#pw-enable-error").textContent = "";
+  await busy(e.currentTarget, "Saving…", async () => {
+    try {
+      const r = await api("/api/vault/setup", { method: "POST", body: { pin: $("#pw-enable-pin").value, password: $("#pw-enable-new").value } });
+      $("#pw-enable-pin").value = "";
+      $("#pw-enable-new").value = "";
+      const box = $("#pw-enable-recovery");
+      box.hidden = false;
+      box.replaceChildren(recoveryBlock(r.recovery_key, () => { box.hidden = true; loadSettings("security"); }));
+      toast("Startup password set. Remove SECRET_KEY from your settings.");
+    } catch (err) { $("#pw-enable-error").textContent = err.message; }
+  });
+});
+
 $("#auto-lock").addEventListener("change", async (e) => {
   const minutes = Number(e.currentTarget.value);
   try {
@@ -1158,8 +1365,10 @@ $("#show-key").addEventListener("click", async (e) => {
   $("#key-error").textContent = "";
   await busy(e.currentTarget, "Checking…", async () => {
     try {
-      const { key } = await api("/api/settings/key", { method: "POST", body: { pin: $("#key-pin").value } });
+      const { key } = await api("/api/settings/key", { method: "POST",
+        body: { pin: $("#key-pin").value, password: $("#key-password").value } });
       $("#key-pin").value = "";
+      $("#key-password").value = "";
       $("#key-value").value = key;
       $("#key-box").hidden = false;
     } catch (err) { $("#key-error").textContent = err.message; }

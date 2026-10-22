@@ -6,7 +6,6 @@ The AI-related variables here only pre-fill that screen.
 """
 
 import os
-import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,24 +22,10 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
-def _load_or_create_secret(data_dir: Path) -> str:
-    """Use SECRET_KEY if set, otherwise persist a random one in the data dir."""
-    configured = _env("SECRET_KEY")
-    if configured:
-        return configured
-    path = data_dir / ".secret_key"
-    if path.exists():
-        return path.read_text().strip()
-    value = secrets.token_urlsafe(48)
-    path.write_text(value)
-    path.chmod(0o600)
-    print(f"[braindump] Generated an encryption key at {path}. Back it up with your database.")
-    return value
-
-
 @dataclass
 class Settings:
     data_dir: Path
+    # Opt-out of the startup password: the data key itself (see vault.py). Usually empty.
     secret_key: str
     cookie_secure: bool
     session_days: int
@@ -71,7 +56,7 @@ def load_settings() -> Settings:
 
     return Settings(
         data_dir=data_dir,
-        secret_key=_load_or_create_secret(data_dir),
+        secret_key=_env("SECRET_KEY"),
         cookie_secure=_env_bool("COOKIE_SECURE", False),
         session_days=int(_env("SESSION_DAYS", "30")),
         max_pin_attempts=int(_env("MAX_PIN_ATTEMPTS", "5")),

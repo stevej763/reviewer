@@ -3,6 +3,11 @@
 A backup holds the same ciphertext as the database, so it is no more readable than the database
 itself. Importing decrypts each value with the backup's key and re-encrypts it with this app's
 key, so a backup from the server can be loaded into the Mac app (or the other way round).
+
+Version 1 backups are opened with the source app's raw encryption key. Version 2 backups also
+carry the source app's wrapped data key (see vault.py), so its startup password or recovery key
+opens them; the raw key still works too. An app without a startup password (SECRET_KEY set)
+still writes version 1.
 """
 
 import json
@@ -12,9 +17,11 @@ from .appconfig import KEY as CONFIG_KEY
 from .crypto import Box
 from .db import Store
 from .jobs import day_entries
+from .vault import WrongSecret, open_keyring
 
 FORMAT = "brain-dump-backup"
-VERSION = 1
+VERSION = 2
+VERSIONS = (1, 2)
 KEY_CHECK = "brain-dump"
 
 # Columns copied from a backup; anything else in the file is ignored.
@@ -33,18 +40,20 @@ class BackupError(ValueError):
     pass
 
 
-def export_backup(store: Store) -> dict:
+def export_backup(store: Store, keyring: dict | None = None) -> dict:
     tables = {}
     for table in COLUMNS:
         rows = []
         for row in store.raw_rows(table):
             rows.append({k: (v.decode("ascii") if isinstance(v, bytes) else v) for k, v in row.items()})
         tables[table] = rows
+    extra = {"keyring": keyring} if keyring else {}
     return {
         "format": FORMAT,
-        "version": VERSION,
+        "version": VERSION if keyring else 1,
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "key_check": store.box.seal(KEY_CHECK).decode("ascii"),
+        **extra,
         **tables,
     }
 
@@ -56,7 +65,7 @@ def _parse(raw: bytes) -> dict:
         raise BackupError("That file isn't a Brain Dump backup.") from exc
     if not isinstance(data, dict) or data.get("format") != FORMAT:
         raise BackupError("That file isn't a Brain Dump backup.")
-    if data.get("version") != VERSION:
+    if data.get("version") not in VERSIONS:
         raise BackupError("This backup was made by a different version of Brain Dump.")
     return data
 
@@ -76,15 +85,39 @@ def _summary(text: str | None) -> str | None:
     return text if isinstance(value, dict) else None
 
 
-def import_backup(store: Store, raw: bytes, secret: str) -> dict:
+def _source_box(data: dict, key: str, own_key: str) -> Box:
+    """The Box that opens this backup. `key` is what was typed: for version 1 the source app's
+    encryption key, for version 2 also its startup password or recovery key. Blank means the
+    backup came from this app."""
+    candidates = []
+    if not key:
+        candidates.append(own_key)
+    else:
+        if data.get("version") == 2 and isinstance(data.get("keyring"), dict):
+            try:
+                candidates.append(open_keyring(data["keyring"], key))
+            except WrongSecret:
+                pass
+        candidates.append(key)
+    for secret in candidates:
+        box = Box(secret)
+        try:
+            if box.open(data["key_check"].encode()) == KEY_CHECK:
+                return box
+        except (KeyError, AttributeError, RuntimeError):
+            continue
+    if data.get("version") == 2:
+        if not key:
+            raise BackupError("This backup came from another copy of Brain Dump. Enter that app's startup "
+                              "password or recovery key.")
+        raise BackupError("That password or key doesn't unlock this backup.")
+    raise BackupError("That key doesn't unlock this backup.")
+
+
+def import_backup(store: Store, raw: bytes, key: str, own_key: str) -> dict:
     """Add what's in the backup that this app doesn't have yet. Nothing here is overwritten."""
     data = _parse(raw)
-    source = Box(secret)
-    try:
-        if source.open(data["key_check"].encode()) != KEY_CHECK:
-            raise RuntimeError
-    except (KeyError, AttributeError, RuntimeError):
-        raise BackupError("That key doesn't unlock this backup.") from None
+    source = _source_box(data, key, own_key)
 
     def reveal(value):
         return source.open(value.encode()) if value else None
