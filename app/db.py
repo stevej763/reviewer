@@ -83,6 +83,15 @@ class Store:
         finally:
             conn.close()
 
+    def _summary(self, blob: bytes | None) -> dict | None:
+        if not blob:
+            return None
+        value = json.loads(self.box.open(blob))
+        if isinstance(value, str):
+            # Backups loaded by the first version of import stored the JSON text JSON-encoded again.
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
+
     # ---- raw rows, for encrypted backups ----------------------------------
 
     BACKUP_TABLES = ("entries", "day_summaries", "reports", "settings")
@@ -124,7 +133,7 @@ class Store:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "text": self.box.open(row["raw_text"]),
-            "summary": json.loads(self.box.open(row["summary"])) if row["summary"] else None,
+            "summary": self._summary(row["summary"]),
             "provider": row["provider"],
             "model": row["model"],
             "status": row["status"],
@@ -218,7 +227,7 @@ class Store:
             "updated_at": row["updated_at"],
             "status": row["status"],
             "error": row["error"],
-            "summary": json.loads(self.box.open(row["summary"])) if row["summary"] else None,
+            "summary": self._summary(row["summary"]),
             "fingerprint": row["fingerprint"],
             "entry_count": row["entry_count"],
             "provider": row["provider"],
