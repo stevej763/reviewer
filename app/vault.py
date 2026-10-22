@@ -7,11 +7,6 @@ that is shown a single time when you create the password. scrypt makes each pass
 slow. So the app starts locked, and until someone types the password it can't read anything.
 
 Changing the password only re-wraps the data key, so no data is re-encrypted.
-
-Older installs kept the data key in plain text in `.secret_key`. That key becomes the data
-key when you first create a password, and the file is then deleted. Setting SECRET_KEY in
-the environment opts out: the app then starts unlocked with that key, unless a keyring
-exists, which always wins.
 """
 
 import base64
@@ -30,7 +25,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .crypto import derive_key
 
 KEYRING_FILE = "keyring.json"
-LEGACY_FILE = ".secret_key"
 # About half a second and 128 MB per guess. Stored with each wrapped key, so changing these
 # only affects passwords set afterwards.
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**17, 8, 1
@@ -40,7 +34,6 @@ WORDLIST = Path(__file__).parent / "wordlist.txt"
 
 # States, as the web app sees them
 SETUP = "setup"        # brand new: create a password
-MIGRATE = "migrate"    # an older install with .secret_key: create a password (and prove it's you with the PIN)
 LOCKED = "locked"      # type the password (or recovery key)
 UNLOCKED = "unlocked"
 
@@ -170,27 +163,16 @@ def suggest_passphrase(words: int = 5) -> str:
 class Vault:
     """Holds the data key once unlocked (in memory only) and manages keyring.json."""
 
-    def __init__(self, data_dir: Path, env_secret: str = ""):
+    def __init__(self, data_dir: Path):
         self._dir = data_dir
         self._lock = threading.Lock()
         self._dek: str | None = None
         self._listeners: list = []
-        self.from_env = False
-        keyring = self._read()
-        if keyring is None and env_secret:
-            self.from_env = True  # opted out with SECRET_KEY
-            self._dek = env_secret
-        elif keyring is not None and env_secret:
-            print("[braindump] SECRET_KEY is set but a startup password protects this data, so SECRET_KEY "
-                  "is ignored. Remove it from your environment.")
+        self._read()  # a damaged keyring should stop the app starting, not surface later
 
     @property
     def keyring_path(self) -> Path:
         return self._dir / KEYRING_FILE
-
-    @property
-    def legacy_path(self) -> Path:
-        return self._dir / LEGACY_FILE
 
     def _read(self) -> dict | None:
         if not self.keyring_path.exists():
@@ -209,18 +191,13 @@ class Vault:
             os.fsync(f.fileno())
         os.replace(tmp, self.keyring_path)
 
-    def legacy_key(self) -> str | None:
-        if self.legacy_path.exists():
-            return self.legacy_path.read_text().strip() or None
-        return None
-
     @property
     def state(self) -> str:
         if self._dek is not None:
             return UNLOCKED
         if self.keyring_path.exists():
             return LOCKED
-        return MIGRATE if self.legacy_key() else SETUP
+        return SETUP
 
     @property
     def unlocked(self) -> bool:
@@ -249,19 +226,15 @@ class Vault:
             for callback in self._listeners:
                 callback(dek)
 
-    def known_key(self) -> str | None:
-        """The data key before any password exists: SECRET_KEY or an older install's .secret_key."""
-        return self._dek if self.from_env else self.legacy_key()
-
     def create_password(self, password: str) -> str:
-        """Wrap the data key (an existing one, or a new random one) and return the recovery key."""
+        """Make a new random data key, wrap it, and return the recovery key."""
         problem = password_problem(password)
         if problem:
             raise ValueError(problem)
         with self._lock:
             if self.has_password:
                 raise RuntimeError("A startup password is already set.")
-            dek = self.known_key() or secrets.token_urlsafe(48)
+            dek = secrets.token_urlsafe(48)
             recovery = new_recovery_key()
             self._write({"format": "brain-dump-keyring", "version": 1, "check": fingerprint(dek),
                          "slots": {"password": wrap(dek, password, "password"),
@@ -269,9 +242,6 @@ class Vault:
             # Only once the keyring is safely on disk and opens with the new password.
             if open_keyring(self._read(), password) != dek:
                 raise RuntimeError("Couldn't save the startup password.")
-            if self.legacy_path.exists():
-                self.legacy_path.unlink()
-            self.from_env = False
         self._opened(dek)
         return recovery
 

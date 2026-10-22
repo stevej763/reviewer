@@ -305,8 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             unlockingWithTouchID = false
             if viaTouchID {
                 signInWithCode()
-            } else if message["password"] as? Bool == true && !touchID.isOn && !touchID.declined
-                        && TouchIDKey.available {
+            } else if !touchID.isOn && !touchID.declined && TouchIDKey.available {
                 whenPageReady { self.offerTouchID() }
             }
         case "key":
