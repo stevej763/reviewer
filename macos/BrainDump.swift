@@ -1,4 +1,4 @@
-// Brain Dump: a Mac app that runs the Reviewer server privately on this Mac and shows it
+// Brain Dump: a Mac app that runs the Brain Dump server privately on this Mac and shows it
 // in a native window. The bundled Python server starts when the app opens and stops when
 // it quits. Only the AI model lives outside the app, in the Ollama app.
 

@@ -1,4 +1,4 @@
-"""Starts the Reviewer server for the Brain Dump Mac app: python3 launcher.py <port>.
+"""Starts the Brain Dump server for the Mac app: python3 launcher.py <port>.
 
 Exits when the app that started it goes away, even if the app was force-quit."""
 

@@ -1,6 +1,6 @@
 {
-  "name": "Reviewer",
-  "short_name": "Reviewer",
+  "name": "Brain Dump",
+  "short_name": "Brain Dump",
   "description": "Talk about your workday; get highlights and reports.",
   "start_url": "/#log",
   "display": "standalone",

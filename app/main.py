@@ -23,7 +23,7 @@ from .prompts import REPORT_STYLES
 from .transcribe import MODELS as SPEECH_MODELS
 from .transcribe import Transcriber
 
-log = logging.getLogger("reviewer")
+log = logging.getLogger("braindump")
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_AUDIO_BYTES = 50 * 1024 * 1024
 MAX_CHUNK_BYTES = 10 * 1024 * 1024
@@ -216,7 +216,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             return preferred
         return next(iter(available), None)
 
-    app = FastAPI(title="Reviewer", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Brain Dump", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -632,7 +632,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     @app.get("/api/export/backup.json", dependencies=[Depends(require_login)])
     def export_backup():
         payload = {"entries": store.list_entries(), "reports": [store.get_report(r["id"]) for r in store.list_reports()]}
-        return _download(json.dumps(payload, indent=2).encode(), "reviewer-backup.json", "application/json")
+        return _download(json.dumps(payload, indent=2).encode(), "braindump-backup.json", "application/json")
 
     # ---- static web app --------------------------------------------------
 

@@ -317,7 +317,7 @@ def test_failed_transcription_can_be_retried(make_client):
 
 def test_security_headers_and_static(client):
     r = client.get("/")
-    assert r.status_code == 200 and "Reviewer" in r.text
+    assert r.status_code == 200 and "Brain Dump" in r.text
     assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
     assert client.get("/static/app.js").status_code == 200
 

@@ -1,7 +1,7 @@
-# Reviewer
+# Brain Dump
 
 A private work journal that runs on your Mac. At the end of the day, talk (or type) for a few
-minutes about what you did. Reviewer transcribes it locally, turns it into easy-to-read
+minutes about what you did. Brain Dump transcribes it locally, turns it into easy-to-read
 highlights with an AI model, and stores it encrypted. Later, pick a date range and get a
 performance review, brag doc, status update or blog post, exportable as Word, Markdown, a web
 page or a CSV spreadsheet.
@@ -16,7 +16,7 @@ page or a CSV spreadsheet.
 **1. Install and open Ollama** from [ollama.com/download](https://ollama.com/download). It runs
 natively so it can use the Mac's GPU (Docker on a Mac can't), and listens on port 11434.
 
-**2. Start Reviewer:**
+**2. Start Brain Dump:**
 
 ```sh
 docker compose up -d --build
@@ -43,9 +43,9 @@ You can switch models in Settings at any time, and each entry has a "Redo summar
 compare. Ollama unloads the model after 15 minutes idle, so the first summary after a break
 takes a few extra seconds.
 
-## Mac app (Brain Dump)
+## Mac app
 
-There is also a self-contained Mac app, **Brain Dump**, which runs the whole thing without
+There is also a self-contained Mac app, **Brain Dump.app**, which runs the whole thing without
 Docker. It carries its own Python and starts the server when you open it, then stops it
 when you quit. You still need the Ollama app for summaries.
 

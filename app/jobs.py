@@ -29,7 +29,7 @@ SALVAGE_AFTER_SECONDS = 10 * 60
 
 CANCELLED_MESSAGE = "Summary cancelled. Your text is saved; try again whenever you like."
 
-log = logging.getLogger("reviewer.jobs")
+log = logging.getLogger("braindump.jobs")
 
 
 class AudioStore:
@@ -157,9 +157,9 @@ class Worker:
             self.enqueue(entry_id)
         for day in self._store.pending_days():
             self.enqueue_day(day)
-        self._thread = threading.Thread(target=self._loop, name="reviewer-worker", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="braindump-worker", daemon=True)
         self._thread.start()
-        threading.Thread(target=self._salvage_loop, name="reviewer-salvage", daemon=True).start()
+        threading.Thread(target=self._salvage_loop, name="braindump-salvage", daemon=True).start()
 
     def _salvage_loop(self) -> None:
         while True:
