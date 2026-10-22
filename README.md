@@ -43,6 +43,25 @@ You can switch models in Settings at any time, and each entry has a "Redo summar
 compare. Ollama unloads the model after 15 minutes idle, so the first summary after a break
 takes a few extra seconds.
 
+## Mac app (Brain Dump)
+
+There is also a self-contained Mac app, **Brain Dump**, which runs the whole thing without
+Docker. It carries its own Python and starts the server when you open it, then stops it
+when you quit. You still need the Ollama app for summaries.
+
+```sh
+./macos/build.sh    # Apple Silicon, needs the Xcode command line tools
+```
+
+This builds `macos/dist/Brain Dump.app` and `macos/dist/Brain Dump.dmg`. Open the disk image
+and drag Brain Dump to Applications. In the setup screen the Ollama address is
+`http://localhost:11434`. The app keeps its data in `~/Library/Application Support/Brain Dump`
+(View → Show Data Folder), separate from the Docker volume. Its server log is in
+`~/Library/Logs/Brain Dump`.
+
+The app is signed only for the Mac that built it. Copied to another Mac, it needs
+right-click → Open the first time.
+
 ## Configuration
 
 Nothing is required in `.env`. See [`.env.example`](.env.example) for the optional settings.
