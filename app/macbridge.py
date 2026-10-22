@@ -7,8 +7,8 @@ single-use sign-in codes for the PIN screen. Nothing here is reachable over HTTP
 Mac app -> server:  {"type": "unlock", "key": ...}   unlock with the key from the Keychain
                     {"type": "get_key"}              the key, to keep in the Keychain behind Touch ID
                     {"type": "login_code"}           a code the page swaps for a session (/api/mac/login)
-Server -> Mac app:  {"type": "state", "state": ..., "password": bool}  on start
-                    {"type": "unlocked", "password": bool}
+Server -> Mac app:  {"type": "state", "state": ...}  on start
+                    {"type": "unlocked"}
                     {"type": "key", "key": ...}, {"type": "login_code", "code": ...}
                     {"type": "error", "for": ..., "message": ...}
 """
@@ -36,8 +36,8 @@ class MacBridge:
             self._out.flush()
 
     def start(self) -> None:
-        self.send({"type": "state", "state": self._vault.state, "password": self._vault.has_password})
-        self._vault.on_unlock(lambda _dek: self.send({"type": "unlocked", "password": self._vault.has_password}))
+        self.send({"type": "state", "state": self._vault.state})
+        self._vault.on_unlock(lambda _dek: self.send({"type": "unlocked"}))
 
     def serve(self, lines) -> None:
         for line in lines:
@@ -59,10 +59,10 @@ class MacBridge:
                 # A key from before a reset, say. The Mac app forgets it and asks for the password.
                 self.send({"type": "error", "for": "unlock", "message": "That key doesn't fit."})
         elif kind == "get_key":
-            if self._vault.unlocked and self._vault.has_password:
+            if self._vault.unlocked:
                 self.send({"type": "key", "key": self._vault.dek})
             else:
-                self.send({"type": "error", "for": "get_key", "message": "Not unlocked with a password."})
+                self.send({"type": "error", "for": "get_key", "message": "Not unlocked yet."})
         elif kind == "login_code":
             if self._vault.unlocked and self._config.is_setup:
                 self.send({"type": "login_code", "code": self._auth.issue_code()})

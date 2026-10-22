@@ -25,8 +25,6 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class Settings:
     data_dir: Path
-    # Opt-out of the startup password: the data key itself (see vault.py). Usually empty.
-    secret_key: str
     cookie_secure: bool
     session_days: int
     max_pin_attempts: int
@@ -53,10 +51,12 @@ class Settings:
 def load_settings() -> Settings:
     data_dir = Path(_env("DATA_DIR", "./data")).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    if _env("SECRET_KEY"):
+        print("[braindump] SECRET_KEY is no longer used: the encryption key is protected by the startup "
+              "password. Remove SECRET_KEY from your environment.")
 
     return Settings(
         data_dir=data_dir,
-        secret_key=_env("SECRET_KEY"),
         cookie_secure=_env_bool("COOKIE_SECURE", False),
         session_days=int(_env("SESSION_DAYS", "30")),
         max_pin_attempts=int(_env("MAX_PIN_ATTEMPTS", "5")),

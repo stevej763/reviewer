@@ -216,25 +216,20 @@ function vaultForm(title, intro, fields, button, onSubmit, extra = []) {
 
 function showVault(v) {
   if (v.state === "locked") return showUnlock(v);
-  const migrating = v.state === "migrate";
   const p = passwordInputs();
-  const pin = input({ type: "password", inputmode: "numeric", autocomplete: "current-password" });
   const fields = [
-    v.pin_required ? field("Your PIN", pin) : null,
     field("Startup password", p.pw), p.strength,
     field("Type it again", p.pw2),
     el("div", { class: "actions" }, p.suggest),
     el("p", { class: "muted small" }, "At least 12 characters. A few random words are easy to remember and hard to guess."),
-  ].filter(Boolean);
+  ];
   vaultForm(
-    migrating ? "Add a startup password" : "Create a startup password",
-    migrating
-      ? "Brain Dump now keeps your encryption key locked behind a password you type when it starts, instead of in a file next to your data. Nothing is re-encrypted and your entries stay as they are."
-      : "Your data is encrypted with a key that's locked by this password. You'll type it each time Brain Dump starts (or use Touch ID in the Mac app).",
-    fields, migrating ? "Add password" : "Create password",
+    "Create a startup password",
+    "Your data is encrypted with a key that's locked by this password. You'll type it each time Brain Dump starts (or use Touch ID in the Mac app).",
+    fields, "Create password",
     async () => {
       if (p.pw.value !== p.pw2.value) throw new Error("The passwords don't match.");
-      const r = await api("/api/vault/setup", { method: "POST", body: { password: p.pw.value, pin: pin.value } });
+      const r = await api("/api/vault/setup", { method: "POST", body: { password: p.pw.value } });
       showRecovery(r.recovery_key);
     });
 }
@@ -1272,12 +1267,6 @@ async function loadSettings(tab = settingsTab) {
   $("#settings-form").hidden = settingsTab === "security";
   if (settingsTab === "security") {
     $("#auto-lock").value = String(idle.minutes);
-    try { state.vault = await api("/api/vault"); } catch { /* keep what we had */ }
-    const v = state.vault || {};
-    $("#password-change").hidden = !v.password;
-    $("#password-enable").hidden = v.password || !v.from_env;
-    $("#password-card").hidden = !v.password && !v.from_env;
-    $("#key-password-field").hidden = !v.password;
     return;
   }
   try {
@@ -1317,7 +1306,6 @@ async function suggestInto(box) {
   } catch (err) { toast(err.message); }
 }
 $("#pw-suggest").addEventListener("click", () => suggestInto($("#pw-new")));
-$("#pw-enable-suggest").addEventListener("click", () => suggestInto($("#pw-enable-new")));
 
 $("#change-password").addEventListener("click", async (e) => {
   $("#pw-error").textContent = "";
@@ -1333,21 +1321,6 @@ $("#change-password").addEventListener("click", async (e) => {
   });
 });
 
-$("#enable-password").addEventListener("click", async (e) => {
-  $("#pw-enable-error").textContent = "";
-  await busy(e.currentTarget, "Saving…", async () => {
-    try {
-      const r = await api("/api/vault/setup", { method: "POST", body: { pin: $("#pw-enable-pin").value, password: $("#pw-enable-new").value } });
-      $("#pw-enable-pin").value = "";
-      $("#pw-enable-new").value = "";
-      const box = $("#pw-enable-recovery");
-      box.hidden = false;
-      box.replaceChildren(recoveryBlock(r.recovery_key, () => { box.hidden = true; loadSettings("security"); }));
-      toast("Startup password set. Remove SECRET_KEY from your settings.");
-    } catch (err) { $("#pw-enable-error").textContent = err.message; }
-  });
-});
-
 $("#auto-lock").addEventListener("change", async (e) => {
   const minutes = Number(e.currentTarget.value);
   try {
@@ -1358,30 +1331,6 @@ $("#auto-lock").addEventListener("change", async (e) => {
   } catch (err) {
     e.currentTarget.value = String(idle.minutes);
     toast(err.message);
-  }
-});
-
-$("#show-key").addEventListener("click", async (e) => {
-  $("#key-error").textContent = "";
-  await busy(e.currentTarget, "Checking…", async () => {
-    try {
-      const { key } = await api("/api/settings/key", { method: "POST",
-        body: { pin: $("#key-pin").value, password: $("#key-password").value } });
-      $("#key-pin").value = "";
-      $("#key-password").value = "";
-      $("#key-value").value = key;
-      $("#key-box").hidden = false;
-    } catch (err) { $("#key-error").textContent = err.message; }
-  });
-});
-
-$("#copy-key").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText($("#key-value").value);
-    toast("Key copied");
-  } catch {
-    $("#key-value").select();
-    toast("Select the key and copy it");
   }
 });
 

@@ -102,6 +102,10 @@ class Store:
         with self._conn() as conn:
             return [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
 
+    def is_empty(self) -> bool:
+        with self._conn() as conn:
+            return not any(conn.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone() for t in self.BACKUP_TABLES)
+
     def insert_rows(self, table: str, rows: list[dict]) -> None:
         assert table in self.BACKUP_TABLES
         with self._conn() as conn:

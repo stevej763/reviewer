@@ -137,18 +137,8 @@ class PinChangeIn(BaseModel):
         return _check_pin(v)
 
 
-class KeyIn(BaseModel):
-    pin: str = Field(max_length=64)
-    password: str = Field(default="", max_length=MAX_PASSWORD)
-
-
 class PasswordIn(BaseModel):
     password: str = Field(max_length=MAX_PASSWORD)
-
-
-class VaultSetupIn(BaseModel):
-    password: str = Field(max_length=MAX_PASSWORD)
-    pin: str = Field(default="", max_length=64)  # an existing install proves it's you with the PIN
 
 
 class RecoverIn(BaseModel):
@@ -237,9 +227,9 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     """`providers` overrides the configured AI providers; `background=False` leaves queued
     work for the caller to run with app.state.worker.drain() (both used by tests)."""
     settings = settings or load_settings()
-    # The app starts locked: nothing can be read until the startup password is typed (or
-    # SECRET_KEY opts out). The Box and session signing get their key on unlock.
-    vault = Vault(settings.data_dir, settings.secret_key)
+    # The app starts locked: nothing can be read until the startup password is typed.
+    # The Box and session signing get their key on unlock.
+    vault = Vault(settings.data_dir)
     box = Box()
     store = Store(settings.db_path, box)
     config = AppConfig(store, settings)
@@ -354,14 +344,6 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     # ---- startup password ------------------------------------------------
 
-    def legacy_config() -> AppConfig | None:
-        """Before a password exists the data key is known (SECRET_KEY or .secret_key), so the
-        stored PIN can be checked to make sure it's you turning on the password."""
-        known = vault.known_key()
-        if not known:
-            return None
-        return config if vault.unlocked else AppConfig(Store(settings.db_path, Box(known)), settings)
-
     def check_password_guess(ok, status: int = 400):
         """Run one password check under the lockout. `ok` does the (slow) check."""
         with guess_lock:
@@ -370,12 +352,6 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
                 raise unlock_lockout.failed(status)
             unlock_lockout.succeeded()
 
-    def check_pin_guess(cfg: AppConfig, pin: str):
-        auth.lockout.check()
-        if not cfg.check_pin(pin.strip()):
-            raise auth.lockout.failed(400)
-        auth.lockout.succeeded()
-
     def bad_password(password: str):
         problem = password_problem(password)
         if problem:
@@ -383,14 +359,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.get("/api/vault")
     def vault_state():
-        legacy = legacy_config() if not vault.has_password else None
-        return {
-            "state": vault.state,
-            "password": vault.has_password,
-            "from_env": vault.from_env,
-            "pin_required": bool(legacy and legacy.is_setup),
-            "locked_for": unlock_lockout.locked_for(),
-        }
+        return {"state": vault.state, "locked_for": unlock_lockout.locked_for()}
 
     @app.get("/api/vault/suggest")
     def vault_suggest():
@@ -401,21 +370,16 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         return {"problem": password_problem(body.password)}
 
     @app.post("/api/vault/setup")
-    def vault_setup(body: VaultSetupIn, request: Request, response: Response):
+    def vault_setup(body: PasswordIn):
         """Create the startup password. Returns the recovery key, which is shown only this once."""
         if vault.has_password:
             raise HTTPException(409, "A startup password is already set.")
-        if vault.unlocked and config.is_setup:
-            require_login(request)  # SECRET_KEY installs turn it on from Settings
+        if not store.is_empty():
+            # Data without a keyring: its key isn't here, and a new one would never open it.
+            raise HTTPException(409, "There's data here but no keyring.json to unlock it. Restore keyring.json "
+                                     "to the data folder, or start with an empty data folder and load a backup.")
         bad_password(body.password)
-        legacy = legacy_config()
-        pin_checked = bool(legacy and legacy.is_setup)
-        if pin_checked:
-            check_pin_guess(legacy, body.pin)
-        recovery = vault.create_password(body.password)
-        if pin_checked and not logged_in(request):
-            set_session_cookie(response, auth.issue_token())  # you just typed the PIN
-        return {"recovery_key": recovery}
+        return {"recovery_key": vault.create_password(body.password)}
 
     @app.post("/api/vault/unlock")
     def vault_unlock(body: PasswordIn):
@@ -824,8 +788,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.get("/api/export/backup.json", dependencies=[Depends(require_login)])
     def export_backup():
-        # Still encrypted: opening it needs this app's startup password, recovery key or
-        # encryption key (Settings → PIN & data).
+        # Still encrypted: opening it needs this app's startup password or recovery key.
         payload = backup.export_backup(store, vault.export_keyring())
         name = f"braindump-backup-{date.today().isoformat()}.json"
         return _download(json.dumps(payload, indent=1).encode(), name, "application/json")
@@ -851,13 +814,6 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
                 config.update({"profile": fields})
                 result["profile"] = True
         return result
-
-    @app.post("/api/settings/key", dependencies=[Depends(require_login)])
-    def show_key(body: KeyIn):
-        check_pin_guess(config, body.pin)
-        if vault.has_password:
-            check_password_guess(lambda: vault.check_password(body.password))
-        return {"key": vault.dek}
 
     # ---- static web app --------------------------------------------------
 

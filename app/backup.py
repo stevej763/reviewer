@@ -6,8 +6,7 @@ key, so a backup from the server can be loaded into the Mac app (or the other wa
 
 Version 1 backups are opened with the source app's raw encryption key. Version 2 backups also
 carry the source app's wrapped data key (see vault.py), so its startup password or recovery key
-opens them; the raw key still works too. An app without a startup password (SECRET_KEY set)
-still writes version 1.
+opens them; the raw key still works too.
 """
 
 import json
