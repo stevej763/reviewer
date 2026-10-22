@@ -68,6 +68,14 @@ def _rows(data: dict, table: str) -> list[dict]:
     return [{c: r.get(c) for c in COLUMNS[table]} for r in rows]
 
 
+def _summary(text: str | None) -> str | None:
+    """A summary is stored as JSON text; keep it as that text, or drop it if it isn't an object."""
+    if not text:
+        return None
+    value = json.loads(text)
+    return text if isinstance(value, dict) else None
+
+
 def import_backup(store: Store, raw: bytes, secret: str) -> dict:
     """Add what's in the backup that this app doesn't have yet. Nothing here is overwritten."""
     data = _parse(raw)
@@ -95,9 +103,9 @@ def import_backup(store: Store, raw: bytes, secret: str) -> dict:
             date.fromisoformat(row["start_date"]), date.fromisoformat(row["end_date"])
         for row in entries:
             row["raw_text"] = reveal(row["raw_text"]) or ""
-            row["summary"] = reveal(row["summary"])
+            row["summary"] = _summary(reveal(row["summary"]))
         for row in days:
-            row["summary"] = reveal(row["summary"])
+            row["summary"] = _summary(reveal(row["summary"]))
         for row in reports:
             row["title"], row["content"] = reveal(row["title"]) or "", reveal(row["content"]) or ""
         backup_config = next((json.loads(reveal(r["value"])) for r in settings if r["key"] == CONFIG_KEY), {})
@@ -124,7 +132,7 @@ def import_backup(store: Store, raw: bytes, secret: str) -> dict:
         if row["status"] in ("summarising", "transcribing", "recording"):
             row["status"], row["error"] = "failed", "Highlights hadn't finished when the backup was made."
         new_entries.append({**row, "id": None, "raw_text": reseal(row["raw_text"]),
-                            "summary": reseal(json.dumps(row["summary"]) if row["summary"] else None)})
+                            "summary": reseal(row["summary"])})
     store.insert_rows("entries", [{k: v for k, v in r.items() if k != "id"} for r in new_entries])
     counts["entries"] = len(new_entries)
 
@@ -141,7 +149,7 @@ def import_backup(store: Store, raw: bytes, secret: str) -> dict:
             row["fingerprint"] = day_entries(store, day)[1]
         if row["status"] != "done":
             row["status"], row["error"] = "done", None
-        new_days.append({**row, "summary": reseal(json.dumps(row["summary"]))})
+        new_days.append({**row, "summary": reseal(row["summary"])})
     store.insert_rows("day_summaries", new_days)
     counts["days"] = len(new_days)
 

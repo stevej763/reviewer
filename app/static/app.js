@@ -332,7 +332,7 @@ const PENDING = { transcribing: "Transcribing your recording…", summarising: "
 function summaryParts(s) {
   const parts = [];
   if (s.headline) parts.push(el("div", { class: "headline" }, s.headline));
-  if (s.highlights.length) {
+  if (s.highlights && s.highlights.length) {
     parts.push(el("ul", { class: "highlights" }, s.highlights.map((h) => el("li", {},
       el("div", {}, el("span", { class: "tag" }, h.category), h.text),
       h.impact ? el("div", { class: "impact" }, h.impact) : null))));
@@ -342,7 +342,7 @@ function summaryParts(s) {
   if (facts.length) {
     parts.push(el("div", { class: "facts" }, facts.map(([k, v]) => el("div", {}, el("b", {}, `${k}: `), v.join(" · ")))));
   }
-  if (s.tags.length) parts.push(el("div", {}, s.tags.map((t) => el("span", { class: "tag" }, t))));
+  if (s.tags && s.tags.length) parts.push(el("div", {}, s.tags.map((t) => el("span", { class: "tag" }, t))));
   return parts;
 }
 

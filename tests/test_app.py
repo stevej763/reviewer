@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -607,8 +608,10 @@ def test_backup_stays_encrypted_and_moves_to_another_app(make_client, tmp_path, 
     r = c2.post("/api/import/backup", files=files, data={"key": key}).json()
     assert (r["entries"], r["days"], r["reports"], r["profile"]) == (2, 1, 1, True)
     assert {e["text"] for e in c2.get("/api/entries").json()} == {"Shipped Apollo", "Mentored Sam", "Already here"}
+    imported = next(e for e in c2.get("/api/entries").json() if e["text"] == "Shipped Apollo")
+    assert imported["summary"]["highlights"][0]["impact"] == "Unblocked the team"
     day = c2.get("/api/days/2026-10-19").json()
-    assert day["summary"] and day["stale"] is False
+    assert day["summary"]["highlights"] and day["stale"] is False
     assert c2.get("/api/reports").json()[0]["title"] == "My Review"
     assert c2.get("/api/settings").json()["profile"]["name"] == "Steve"
     assert app2.state.config.check_pin(PIN)  # PIN unchanged
@@ -617,3 +620,13 @@ def test_backup_stays_encrypted_and_moves_to_another_app(make_client, tmp_path, 
     assert app2.state.store.raw_rows("entries")[-1]["raw_text"] not in raw
     r = c2.post("/api/import/backup", files=files, data={"key": key}).json()
     assert (r["entries"], r["days"], r["reports"]) == (0, 0, 0)
+
+
+def test_double_encoded_summaries_still_read(client):
+    # The first version of backup import stored summaries as a JSON string inside JSON.
+    e = client.post("/api/entries", json={"date": "2026-10-19", "text": "Shipped Apollo"}).json()
+    store = client.app.state.store
+    with store._conn() as conn:
+        conn.execute("UPDATE entries SET summary=? WHERE id=?", (store.box.seal(json.dumps(json.dumps(e["summary"]))),
+                                                                 e["id"]))
+    assert entry(client, e["id"])["summary"] == e["summary"]
