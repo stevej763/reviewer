@@ -841,17 +841,12 @@ def test_backup_v2_opens_with_password_or_recovery_key(make_locked, tmp_path):
     assert b.post("/api/import/backup", files=files, data={"key": recovery}).json()["entries"] == 0  # already in
     assert "Shipped Apollo" in {e["text"] for e in b.get("/api/entries").json()}
 
-    # The raw encryption key still opens it, and v1 backups (made before startup passwords) still load.
-    c = make_locked(tmp_path / "c")
-    first_run(c)
-    assert c.post("/api/import/backup", files=files, data={"key": a.app.state.vault.dek}).json()["entries"] == 1
+    # Only the password or recovery key opens it: not the raw key, and v1 backups aren't accepted.
+    assert b.post("/api/import/backup", files=files, data={"key": a.app.state.vault.dek}).status_code == 400
     v1 = {k: v for k, v in data.items() if k != "keyring"}
     v1["version"] = 1
-    v1["entries"][0]["created_at"] = "2026-10-18T09:00:00+00:00"  # count as a different entry
-    v1 = json.dumps(v1).encode()
-    assert c.post("/api/import/backup", files={"file": ("v1.json", v1)}, data={"key": PASSWORD}).status_code == 400
-    assert c.post("/api/import/backup", files={"file": ("v1.json", v1)},
-                  data={"key": a.app.state.vault.dek}).json()["entries"] == 1
+    r = b.post("/api/import/backup", files={"file": ("v1.json", json.dumps(v1).encode())}, data={"key": PASSWORD})
+    assert r.status_code == 400 and "before startup passwords" in r.json()["detail"]
 
 
 def test_mac_app_channel(make_locked):
