@@ -299,3 +299,13 @@ details pre { white-space: pre-wrap; font: inherit; font-size: .92rem; margin: .
 .progress-row .progress { flex: 1; }
 .progress-label { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
 .eta-label { font-weight: 400; }
+.review-hint { margin: 0; padding: .6rem .8rem; border-radius: 10px; background: var(--accent-soft); font-size: .9rem; }
+.transcript-preview { margin: 0; white-space: pre-wrap; color: var(--muted); }
+.summary-editor { display: grid; gap: 12px; }
+.hl-label { font-size: .92rem; color: var(--muted); }
+.hl-rows { display: grid; gap: 10px; }
+.hl-row { display: grid; gap: 6px; padding-left: 12px; border-left: 3px solid var(--accent-soft); }
+.hl-row-head { display: flex; gap: 8px; align-items: center; }
+.hl-row-head select { flex: 1; min-width: 0; }
+.hl-row-head .btn { flex: none; }
+.summary-editor > .btn { justify-self: start; }

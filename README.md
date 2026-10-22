@@ -7,6 +7,8 @@ performance review, brag doc, status update or blog post, exportable as Word, Ma
 page or a CSV spreadsheet.
 
 - **Everything stays on your Mac.** Speech is transcribed in the container (faster-whisper) and the audio is thrown away. Summaries and reports come from a local model in Ollama, running natively on your Mac.
+- **You check the words first.** After a recording, the transcript drops into the text box so you can fix anything Whisper misheard; it's only summarised when you press Summarise & save. The transcript is saved as soon as it's ready, so leaving the page loses nothing: unchecked recordings wait in the list with a "Check and save" button.
+- **Highlights are editable.** Fix the model's wording or add what it missed with "Edit highlights" (end-of-day summaries too). Reports use your version, and re-summarising asks before replacing your edits.
 - **First-time setup in the app**: your name, role and goals (used to tailor summaries and reports), a PIN, and which AI model to use. Change any of it later in Settings.
 - **Startup password**: your data is encrypted with a random key that is itself locked by a password you type when Brain Dump starts. Until then the app can't read anything, and the key is never stored in the clear. A one-time **recovery key** is the backup way in.
 - **PIN login** for everyday use, stored as a salted scrypt hash, with an escalating lockout after wrong guesses. Entries, reports and settings are encrypted at rest.

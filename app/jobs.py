@@ -5,7 +5,10 @@ can close the page. Work happens one item at a time on a single worker thread
 (Whisper and a local model both want the machine to themselves). Status lives in
 the database, so anything unfinished is picked up again after a restart.
 
-Entry statuses: transcribing -> summarising -> done, or failed (with an error).
+Entry statuses: typed text goes summarising -> done. A recording goes recording ->
+transcribing -> review, and waits there (transcript saved, audio deleted) until you've
+checked and edited the text and submitted it; then summarising -> done. Any step can end
+in failed (with an error).
 
 End-of-day summaries (combining a day's entries) are built when you ask for one.
 A running summary can be cancelled.
@@ -362,9 +365,10 @@ class Worker:
                 return
             combined = "\n\n".join(t for t in (entry["text"].strip(), text.strip()) if t)
             self._store.update_entry(entry_id, text=combined)
-            self._store.set_status(entry_id, "summarising")
-            self._audio.delete(entry_id)  # audio is never kept once transcribed
-            entry = self._store.get_entry(entry_id)
+            # Waits for you to read and correct the transcript before it's summarised.
+            self._store.set_status(entry_id, "review")
+            self._audio.delete(entry_id)  # audio is never kept once transcribed (the transcript is saved)
+            return
 
         if entry["status"] == "summarising":
             if self._is_cancelled("entry", entry_id):

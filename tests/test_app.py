@@ -298,9 +298,15 @@ def test_recording_is_saved_then_processed(make_client, tmp_path):
 
     worker.drain()
     e = entry(c, eid)
-    assert e["status"] == "done" and e["text"] == "heard 12 bytes as .mp4 in en"
-    assert e["summary"]["headline"]
+    # Transcribed and saved, then it waits for you to check it; nothing is summarised yet.
+    assert e["status"] == "review" and e["text"] == "heard 12 bytes as .mp4 in en" and not e["summary"]
     assert not list((tmp_path / "pending-audio").iterdir())  # audio deleted once transcribed
+
+    r = c.post(f"/api/entries/{eid}/submit", json={"date": "2026-10-19", "text": "  heard it, corrected  "})
+    assert r.status_code == 202 and r.json()["status"] == "summarising"
+    worker.drain()
+    e = entry(c, eid)
+    assert e["status"] == "done" and e["text"] == "heard it, corrected" and e["summary"]["headline"]
 
 
 def test_unfinished_work_resumes_after_restart(make_client, tmp_path):
@@ -315,7 +321,7 @@ def test_unfinished_work_resumes_after_restart(make_client, tmp_path):
     for pending in app2.state.store.pending_entry_ids():
         app2.state.worker.enqueue(pending)
     app2.state.worker.drain()
-    assert app2.state.store.get_entry(eid)["status"] == "done"
+    assert app2.state.store.get_entry(eid)["status"] == "review"
 
 
 def test_failed_transcription_can_be_retried(make_client):
@@ -340,6 +346,87 @@ def test_failed_transcription_can_be_retried(make_client):
     c.post(f"/api/entries/{eid}/retry")
     assert entry(c, eid)["text"] == "worked second time"
     assert c.post(f"/api/entries/{eid}/retry").status_code == 409  # only failed entries
+
+
+def test_transcripts_wait_for_review(client):
+    client.post("/api/login", json={"pin": PIN})
+
+    def record(day):
+        rid = client.post("/api/recordings/start", json={"date": day}).json()["id"]
+        client.put(f"/api/recordings/{rid}/chunks/0", content=b"x" * 5)
+        client.post(f"/api/recordings/{rid}/finish", json={"chunks": 1})
+        return rid
+
+    first, second, other = record("2026-10-21"), record("2026-10-21"), record("2026-10-21")
+    assert entry(client, first)["status"] == "review"
+    # Not summarised, not in the end-of-day summary, and can't be re-summarised until checked.
+    assert client.post(f"/api/entries/{first}/summarize", json={}).status_code == 409
+    assert client.post("/api/days/2026-10-21/generate").status_code == 400
+    assert client.post(f"/api/entries/{first}/submit", json={"date": "2026-10-21", "text": " "}).status_code == 400
+
+    # Two transcripts combined in the text box become one entry; the third is left alone.
+    r = client.post(f"/api/entries/{first}/submit",
+                    json={"date": "2026-10-22", "text": "both, edited", "merged": [second, first, 99999]})
+    assert r.status_code == 202
+    e = entry(client, first)
+    assert e["status"] == "done" and e["date"] == "2026-10-22" and e["text"] == "both, edited"
+    assert client.get(f"/api/entries/{second}").status_code == 404
+    assert entry(client, other)["status"] == "review"
+    assert client.post(f"/api/entries/{first}/submit", json={"date": "2026-10-22", "text": "again"}).status_code == 409
+    assert client.post("/api/entries/99999/submit", json={"date": "2026-10-22", "text": "x"}).status_code == 404
+
+    # A finished entry can't be swallowed by merging it into another.
+    client.post(f"/api/entries/{other}/submit", json={"date": "2026-10-21", "text": "solo", "merged": [first]})
+    assert entry(client, first)["status"] == "done"
+
+
+def test_highlights_can_be_edited(make_client):
+    fake = FakeProvider()
+    client, _ = make_client({"claude": fake})
+    client.post("/api/login", json={"pin": PIN})
+    eid = client.post("/api/entries", json={"date": "2026-10-19", "text": "Shipped Apollo"}).json()["id"]
+    original = entry(client, eid)["summary"]
+    assert not original.get("edited")
+    fixed = {**original, "headline": "Shipped Apollo a week early",
+             "highlights": [{"text": "Led the Apollo launch", "category": "LEADERSHIP", "impact": "Saved a week"},
+                            {"text": "  "}],  # blank rows are dropped
+             "wins": ["Apollo live", ""]}
+    r = client.put(f"/api/entries/{eid}", json={"summary": fixed})
+    assert r.status_code == 200
+    e = entry(client, eid)
+    assert e["summary"]["edited"] and e["summary"]["headline"] == "Shipped Apollo a week early"
+    assert e["summary"]["highlights"] == [{"text": "Led the Apollo launch", "category": "leadership", "impact": "Saved a week"}]
+    assert e["summary"]["wins"] == ["Apollo live"]
+    with client.app.state.store._conn() as conn:
+        stored = conn.execute("SELECT summary FROM entries WHERE id=?", (eid,)).fetchone()[0]
+    assert "Apollo" not in str(stored)  # encrypted
+
+    # Reports use your wording.
+    client.post("/api/reports", json={"start": "2026-10-01", "end": "2026-10-31"})
+    assert "Led the Apollo launch" in fake.prompts[-1] and "Saved a week" in fake.prompts[-1]
+
+    # Re-summarising asks first, and only replaces your edits when you say so.
+    r = client.post(f"/api/entries/{eid}/summarize", json={})
+    assert r.status_code == 409 and "edited" in r.json()["detail"]
+    assert entry(client, eid)["summary"]["headline"] == "Shipped Apollo a week early"
+    assert client.post(f"/api/entries/{eid}/summarize", json={"overwrite": True}).status_code == 200
+    assert not entry(client, eid)["summary"].get("edited")
+
+
+def test_end_of_day_summary_can_be_edited(client):
+    for text in ("Morning work", "Afternoon work"):
+        client.post("/api/entries", json={"date": "2026-10-19", "text": text})
+    assert client.put("/api/days/2026-10-19", json={"summary": {"headline": "x"}}).status_code == 404
+    client.post("/api/days/2026-10-19/generate")
+    day = client.get("/api/days/2026-10-19").json()
+    r = client.put("/api/days/2026-10-19", json={"summary": {**day["summary"], "headline": "My own words"}})
+    assert r.status_code == 200
+    day = client.get("/api/days/2026-10-19").json()
+    assert day["summary"]["headline"] == "My own words" and day["summary"]["edited"] and day["stale"] is False
+    assert client.post("/api/days/2026-10-19/generate").status_code == 409
+    assert client.get("/api/days/2026-10-19").json()["summary"]["headline"] == "My own words"
+    assert client.post("/api/days/2026-10-19/generate?overwrite=true").status_code == 200
+    assert not client.get("/api/days/2026-10-19").json()["summary"].get("edited")
 
 
 def test_security_headers_and_static(client):
@@ -548,7 +635,7 @@ def test_chunked_recording(make_client, tmp_path):
     c.post(f"/api/recordings/{rid}/finish", json={"chunks": 3})
     assert captured == {"audio": b"aaabbbccc", "suffix": ".mp4"}
     e = entry(c, rid)
-    assert e["status"] == "done" and e["text"] == "joined up"
+    assert e["status"] == "review" and e["text"] == "joined up"
     assert not list((tmp_path / "pending-audio").iterdir())
     assert c.put(f"/api/recordings/{rid}/chunks/3", content=b"x").status_code == 409
 
@@ -565,7 +652,7 @@ def test_interrupted_recording_is_salvaged(make_client):
     assert worker.salvage_interrupted(idle_seconds=0) == [rid]
     worker.drain()
     e = entry(c, rid)
-    assert e["status"] == "done" and e["text"] == "heard 20 bytes as .webm in en"
+    assert e["status"] == "review" and e["text"] == "heard 20 bytes as .webm in en"
 
     # Nothing arrived at all: it's marked failed rather than left hanging
     empty = c.post("/api/recordings/start", json={"date": "2026-10-21"}).json()["id"]
@@ -767,7 +854,7 @@ def test_pending_work_resumes_after_unlock(make_locked):
     c2 = make_locked()
     assert c2.app.state.worker._queue.empty()  # nothing runs while locked
     c2.post("/api/vault/unlock", json={"password": PASSWORD})
-    assert c2.app.state.store.get_entry(eid)["status"] == "done"
+    assert c2.app.state.store.get_entry(eid)["status"] == "review"
 
 
 def test_old_key_settings_are_gone(make_locked, tmp_path, monkeypatch):
