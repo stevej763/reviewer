@@ -12,6 +12,7 @@ from .transcribe import MODELS as SPEECH_MODELS
 
 KEY = "app"
 PROVIDERS = ("ollama", "claude")
+AUTO_LOCK_MINUTES = (0, 1, 2, 5, 10, 15, 30, 60)  # 0 = never
 
 
 def hash_pin(pin: str) -> str:
@@ -52,6 +53,7 @@ class AppConfig:
             },
             "speech": {"language": s.whisper_language,
                        "model": s.whisper_model if s.whisper_model in SPEECH_MODELS else "small"},
+            "security": {"auto_lock_minutes": 5},
         }
 
     def get(self) -> dict:
@@ -79,6 +81,9 @@ class AppConfig:
             self._store.set_setting(KEY, current)
             self.version += 1
             return current
+
+    def auto_lock_seconds(self) -> int:
+        return int(self.get()["security"].get("auto_lock_minutes") or 0) * 60
 
     def check_pin(self, pin: str) -> bool:
         stored = self.get().get("pin_hash")

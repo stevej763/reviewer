@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import backup, reports
-from .appconfig import PROVIDERS, AppConfig, hash_pin
-from .auth import COOKIE_NAME, PinAuth
+from .appconfig import AUTO_LOCK_MINUTES, PROVIDERS, AppConfig, hash_pin
+from .auth import COOKIE_NAME, Lockout, PinAuth
 from .config import Settings, load_settings
 from .crypto import Box
 from .db import Store
@@ -22,6 +23,7 @@ from .llm import (ModelDownloads, OllamaClient, Provider, ProviderError, about_m
 from .prompts import REPORT_STYLES
 from .transcribe import MODELS as SPEECH_MODELS
 from .transcribe import Transcriber
+from .vault import MAX_PASSWORD, Vault, WrongSecret, password_problem, suggest_passphrase
 
 log = logging.getLogger("braindump")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -29,6 +31,8 @@ MAX_AUDIO_BYTES = 50 * 1024 * 1024
 MAX_CHUNK_BYTES = 10 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 MAX_BACKUP_BYTES = 200 * 1024 * 1024
+# Wrong startup passwords: 5 tries, then a minute's wait that doubles each time.
+MAX_UNLOCK_ATTEMPTS, UNLOCK_LOCKOUT_MINUTES = 5, 1
 
 
 def _check_date(value: str) -> str:
@@ -93,6 +97,17 @@ class SpeechIn(BaseModel):
         return v
 
 
+class SecurityIn(BaseModel):
+    auto_lock_minutes: int = 5
+
+    @field_validator("auto_lock_minutes")
+    @classmethod
+    def _minutes(cls, v):
+        if v not in AUTO_LOCK_MINUTES:
+            raise ValueError(f"auto-lock must be one of {', '.join(map(str, AUTO_LOCK_MINUTES))} minutes")
+        return v
+
+
 class SetupIn(BaseModel):
     profile: ProfileIn
     pin: str
@@ -109,6 +124,7 @@ class SettingsIn(BaseModel):
     profile: ProfileIn | None = None
     ai: AiIn | None = None
     speech: SpeechIn | None = None
+    security: SecurityIn | None = None
 
 
 class PinChangeIn(BaseModel):
@@ -123,6 +139,30 @@ class PinChangeIn(BaseModel):
 
 class KeyIn(BaseModel):
     pin: str = Field(max_length=64)
+    password: str = Field(default="", max_length=MAX_PASSWORD)
+
+
+class PasswordIn(BaseModel):
+    password: str = Field(max_length=MAX_PASSWORD)
+
+
+class VaultSetupIn(BaseModel):
+    password: str = Field(max_length=MAX_PASSWORD)
+    pin: str = Field(default="", max_length=64)  # an existing install proves it's you with the PIN
+
+
+class RecoverIn(BaseModel):
+    recovery_key: str = Field(max_length=200)
+    new_password: str = Field(max_length=MAX_PASSWORD)
+
+
+class PasswordChangeIn(BaseModel):
+    current: str = Field(max_length=MAX_PASSWORD)
+    new: str = Field(max_length=MAX_PASSWORD)
+
+
+class CodeIn(BaseModel):
+    code: str = Field(max_length=200)
 
 
 class OllamaIn(BaseModel):
@@ -197,11 +237,16 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     """`providers` overrides the configured AI providers; `background=False` leaves queued
     work for the caller to run with app.state.worker.drain() (both used by tests)."""
     settings = settings or load_settings()
-    box = Box(settings.secret_key)
+    # The app starts locked: nothing can be read until the startup password is typed (or
+    # SECRET_KEY opts out). The Box and session signing get their key on unlock.
+    vault = Vault(settings.data_dir, settings.secret_key)
+    box = Box()
     store = Store(settings.db_path, box)
     config = AppConfig(store, settings)
-    auth = PinAuth(config.check_pin, lambda: (config.get().get("pin_hash") or "")[-16:], settings.secret_key,
+    auth = PinAuth(config.check_pin, lambda: (config.get().get("pin_hash") or "")[-16:], None,
                    settings.session_days, settings.max_pin_attempts, settings.lockout_minutes)
+    unlock_lockout = Lockout(MAX_UNLOCK_ATTEMPTS, UNLOCK_LOCKOUT_MINUTES, "password")
+    guess_lock = threading.Lock()  # one password guess at a time, so the lockout can't be raced
     transcriber = transcriber or Transcriber(settings)
     downloads = ModelDownloads()
     provider_cache: dict = {"version": None, "providers": {}}
@@ -224,6 +269,14 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     app = FastAPI(title="Brain Dump", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
+    async def require_unlocked(request: Request, call_next):
+        path = request.url.path
+        if not vault.unlocked and path.startswith("/api/") and not (path == "/api/vault"
+                                                                    or path.startswith("/api/vault/")):
+            return JSONResponse({"detail": "Brain Dump is locked.", "vault": vault.state}, status_code=423)
+        return await call_next(request)
+
+    @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
         response.headers["Content-Security-Policy"] = (
@@ -244,10 +297,15 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     async def provider_error(_request: Request, exc: ProviderError):
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
+    def logged_in(request: Request) -> bool:
+        # The cookie is refreshed while you use the app (POST /api/session/active), so one
+        # that's older than the auto-lock time means nobody has touched the app since.
+        return auth.is_valid(request.cookies.get(COOKIE_NAME), config.auto_lock_seconds())
+
     def require_login(request: Request):
         if not config.is_setup:
             raise HTTPException(409, "Finish setting up the app first.")
-        if not auth.is_valid(request.cookies.get(COOKIE_NAME)):
+        if not logged_in(request):
             raise HTTPException(401, "Not logged in")
 
     def pick_provider(name: str | None) -> Provider:
@@ -271,7 +329,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     @app.get("/api/session")
     def session(request: Request):
         setup_done = config.is_setup
-        authenticated = setup_done and auth.is_valid(request.cookies.get(COOKIE_NAME))
+        authenticated = setup_done and logged_in(request)
         info = {
             "setup_required": not setup_done,
             "authenticated": authenticated,
@@ -285,7 +343,120 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             info["providers"] = [{"name": p.name, "model": p.model} for p in current_providers().values()]
             info["default_provider"] = default_provider()
             info["name"] = config.get()["profile"]["name"]
+            info["auto_lock_minutes"] = config.get()["security"]["auto_lock_minutes"]
         return info
+
+    @app.post("/api/session/active", dependencies=[Depends(require_login)])
+    def still_active(response: Response):
+        """The app calls this while you're using it, to push back the auto-lock."""
+        set_session_cookie(response, auth.issue_token())
+        return {"ok": True}
+
+    # ---- startup password ------------------------------------------------
+
+    def legacy_config() -> AppConfig | None:
+        """Before a password exists the data key is known (SECRET_KEY or .secret_key), so the
+        stored PIN can be checked to make sure it's you turning on the password."""
+        known = vault.known_key()
+        if not known:
+            return None
+        return config if vault.unlocked else AppConfig(Store(settings.db_path, Box(known)), settings)
+
+    def check_password_guess(ok, status: int = 400):
+        """Run one password check under the lockout. `ok` does the (slow) check."""
+        with guess_lock:
+            unlock_lockout.check()
+            if not ok():
+                raise unlock_lockout.failed(status)
+            unlock_lockout.succeeded()
+
+    def check_pin_guess(cfg: AppConfig, pin: str):
+        auth.lockout.check()
+        if not cfg.check_pin(pin.strip()):
+            raise auth.lockout.failed(400)
+        auth.lockout.succeeded()
+
+    def bad_password(password: str):
+        problem = password_problem(password)
+        if problem:
+            raise HTTPException(400, problem)
+
+    @app.get("/api/vault")
+    def vault_state():
+        legacy = legacy_config() if not vault.has_password else None
+        return {
+            "state": vault.state,
+            "password": vault.has_password,
+            "from_env": vault.from_env,
+            "pin_required": bool(legacy and legacy.is_setup),
+            "locked_for": unlock_lockout.locked_for(),
+        }
+
+    @app.get("/api/vault/suggest")
+    def vault_suggest():
+        return {"passphrase": suggest_passphrase()}
+
+    @app.post("/api/vault/check")
+    def vault_check(body: PasswordIn):
+        return {"problem": password_problem(body.password)}
+
+    @app.post("/api/vault/setup")
+    def vault_setup(body: VaultSetupIn, request: Request, response: Response):
+        """Create the startup password. Returns the recovery key, which is shown only this once."""
+        if vault.has_password:
+            raise HTTPException(409, "A startup password is already set.")
+        if vault.unlocked and config.is_setup:
+            require_login(request)  # SECRET_KEY installs turn it on from Settings
+        bad_password(body.password)
+        legacy = legacy_config()
+        pin_checked = bool(legacy and legacy.is_setup)
+        if pin_checked:
+            check_pin_guess(legacy, body.pin)
+        recovery = vault.create_password(body.password)
+        if pin_checked and not logged_in(request):
+            set_session_cookie(response, auth.issue_token())  # you just typed the PIN
+        return {"recovery_key": recovery}
+
+    @app.post("/api/vault/unlock")
+    def vault_unlock(body: PasswordIn):
+        if vault.unlocked:
+            return {"ok": True}
+        if not vault.has_password:
+            raise HTTPException(409, "Create a startup password first.")
+
+        def attempt():
+            try:
+                vault.unlock(body.password)
+                return True
+            except WrongSecret:
+                return False
+        check_password_guess(attempt)
+        return {"ok": True}
+
+    @app.post("/api/vault/recover")
+    def vault_recover(body: RecoverIn):
+        """Forgot the password: the recovery key unlocks the app and sets a new password."""
+        if not vault.has_password:
+            raise HTTPException(409, "Create a startup password first.")
+        bad_password(body.new_password)
+
+        def attempt():
+            try:
+                vault.recover(body.recovery_key, body.new_password)
+                return True
+            except WrongSecret:
+                return False
+        check_password_guess(attempt)
+        return {"ok": True}
+
+    @app.post("/api/settings/password", dependencies=[Depends(require_login)])
+    def change_password(body: PasswordChangeIn):
+        if not vault.has_password:
+            raise HTTPException(409, "There's no startup password to change.")
+        bad_password(body.new)
+        check_password_guess(lambda: vault.check_password(body.current))
+        vault.change_password(body.new)  # only re-wraps the data key; nothing is re-encrypted
+        return {"ok": True}
 
     # ---- first-time setup and settings ------------------------------------
 
@@ -317,6 +488,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             changes["ai"] = ai
         if body.speech:
             changes["speech"] = body.speech.model_dump()
+        if body.security:
+            changes["security"] = body.security.model_dump()
         config.update(changes)
         return config.public()
 
@@ -357,6 +530,15 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         set_session_cookie(response, auth.check_pin(body.pin.strip()))
         return {"ok": True}
 
+    @app.post("/api/mac/login")
+    def mac_login(body: CodeIn, response: Response):
+        """The Mac app swaps a single-use code (handed to it over its private pipe to this
+        process, after Touch ID) for a session. Nothing else can get such a code."""
+        if not config.is_setup:
+            raise HTTPException(409, "Finish setting up the app first.")
+        set_session_cookie(response, auth.redeem_code(body.code))
+        return {"ok": True}
+
     @app.post("/api/logout")
     def logout(response: Response):
         response.delete_cookie(COOKIE_NAME, path="/")
@@ -374,8 +556,14 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         about_me=me,
         speech_model=lambda: config.get()["speech"]["model"],
     )
-    if background:
-        worker.start()
+    def opened(dek: str):
+        box.unlock(dek)
+        auth.set_secret(dek)
+        worker.resume()  # unfinished transcriptions and summaries carry on
+        if background:
+            worker.start()
+
+    vault.on_unlock(opened)
 
     def queue_summary(entry_id: int, provider: str | None) -> dict:
         store.set_status(entry_id, "summarising", wanted_provider=provider or "")
@@ -636,8 +824,9 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.get("/api/export/backup.json", dependencies=[Depends(require_login)])
     def export_backup():
-        # Still encrypted: opening it needs this app's encryption key (Settings → PIN & data).
-        payload = backup.export_backup(store)
+        # Still encrypted: opening it needs this app's startup password, recovery key or
+        # encryption key (Settings → PIN & data).
+        payload = backup.export_backup(store, vault.export_keyring())
         name = f"braindump-backup-{date.today().isoformat()}.json"
         return _download(json.dumps(payload, indent=1).encode(), name, "application/json")
 
@@ -648,7 +837,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             raise HTTPException(413, "That backup is too large.")
         try:
             # No key given: assume the backup came from this app.
-            result = backup.import_backup(store, raw, key.strip() or settings.secret_key)
+            result = backup.import_backup(store, raw, key.strip(), vault.dek)
         except backup.BackupError as exc:
             raise HTTPException(400, str(exc)) from exc
         profile, result["profile"] = result.pop("profile"), False
@@ -665,9 +854,10 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.post("/api/settings/key", dependencies=[Depends(require_login)])
     def show_key(body: KeyIn):
-        if not config.check_pin(body.pin.strip()):
-            raise HTTPException(400, "PIN is wrong.")
-        return {"key": settings.secret_key}
+        check_pin_guess(config, body.pin)
+        if vault.has_password:
+            check_password_guess(lambda: vault.check_password(body.password))
+        return {"key": vault.dek}
 
     # ---- static web app --------------------------------------------------
 
@@ -681,6 +871,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    app.state.vault = vault
+    app.state.auth = auth
     app.state.store = store
     app.state.config = config
     app.state.worker = worker

@@ -152,11 +152,16 @@ class Worker:
         self._finish_lock = threading.Lock()
         self._progress: dict[int, float] = {}  # entry id -> transcription progress (in memory only)
 
-    def start(self) -> None:
+    def resume(self) -> None:
+        """Queue whatever was unfinished when the app last stopped (once it's unlocked)."""
         for entry_id in self._store.pending_entry_ids():
             self.enqueue(entry_id)
         for day in self._store.pending_days():
             self.enqueue_day(day)
+
+    def start(self) -> None:
+        if self._thread:
+            return
         self._thread = threading.Thread(target=self._loop, name="braindump-worker", daemon=True)
         self._thread.start()
         threading.Thread(target=self._salvage_loop, name="braindump-salvage", daemon=True).start()

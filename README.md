@@ -8,7 +8,9 @@ page or a CSV spreadsheet.
 
 - **Everything stays on your Mac.** Speech is transcribed in the container (faster-whisper) and the audio is thrown away. Summaries and reports come from a local model in Ollama, running natively on your Mac.
 - **First-time setup in the app**: your name, role and goals (used to tailor summaries and reports), a PIN, and which AI model to use. Change any of it later in Settings.
-- **PIN login** stored as a salted scrypt hash, with an escalating lockout after wrong guesses. Entries, reports and settings are encrypted at rest.
+- **Startup password**: your data is encrypted with a random key that is itself locked by a password you type when Brain Dump starts. Until then the app can't read anything, and the key is never stored in the clear. A one-time **recovery key** is the backup way in.
+- **PIN login** for everyday use, stored as a salted scrypt hash, with an escalating lockout after wrong guesses. Entries, reports and settings are encrypted at rest.
+- **Auto-lock**: asks for the PIN again after 5 minutes of inactivity (change it in Settings → PIN & data). The Mac app also locks when you close its window.
 - **Claude is optional.** Add an Anthropic API key in Settings if you have one. (A Claude.ai or Claude Code subscription doesn't include an API key.)
 
 ## Setup on a Mac
@@ -22,7 +24,8 @@ natively so it can use the Mac's GPU (Docker on a Mac can't), and listens on por
 docker compose up -d --build
 ```
 
-**3. Open [http://localhost:8000](http://localhost:8000)** and fill in the setup screen. The
+**3. Open [http://localhost:8000](http://localhost:8000)**, create a startup password (save the
+recovery key it shows you) and fill in the setup screen. The
 Ollama address is `http://host.docker.internal:11434`, which is how the container reaches the
 Ollama app on your Mac. Press **Check**, pick a model and press **Download**. `qwen3:8b`
 (5.2 GB) is a good fit for a 16 GB MacBook Air.
@@ -62,12 +65,44 @@ and drag Brain Dump to Applications. In the setup screen the Ollama address is
 The app is signed only for the Mac that built it. Copied to another Mac, it needs
 right-click → Open the first time.
 
+**Touch ID.** After you first unlock with your startup password, the app offers to use Touch ID.
+It then keeps the data key in your Keychain, and one touch at launch unlocks your data and signs
+you in; the PIN screen offers Touch ID too. If your fingerprints change, Touch ID turns itself
+off until you type the password again. Turn it on or off in the Brain Dump menu. The key is
+handed to the bundled server over a private pipe, never through the environment or a file.
+
+The strongest form (a Keychain item that only Touch ID can open) needs the app signed with an
+Apple Development certificate and Team ID. The default ad-hoc build can't use that, so it falls
+back to a Touch ID check in front of an ordinary Keychain item (Console.app shows which one is in
+use: search for "Brain Dump"). With the ad-hoc build, macOS may ask for your login password to let a rebuilt app read the
+Keychain item.
+
 ## Configuration
 
 Nothing is required in `.env`. See [`.env.example`](.env.example) for the optional settings.
-The one worth knowing about is `SECRET_KEY`: it encrypts your data. If it isn't set, one is
-generated and kept in the data volume. **If you set it, back it up**, because without it a
-backed-up database can't be read.
+
+`SECRET_KEY` opts out of the startup password: if it's set, it *is* the encryption key and the app
+starts unlocked, with the key sitting in plain text in your environment. Leave it unset unless you
+need unattended restarts. You can switch an existing `SECRET_KEY` install to a startup password in
+**Settings → PIN & data → Startup password**; after that the password wins and you should remove
+`SECRET_KEY` from `.env`.
+
+### How the startup password works
+
+`keyring.json` in the data folder holds the data key wrapped (AES-GCM) twice: once under a key
+derived from your password with scrypt (about half a second per guess), once under the recovery
+key. Wrong passwords are rate-limited (5 tries, then a wait that doubles). Changing the password
+only re-wraps the key, so nothing is re-encrypted. After a restart, every API call except
+unlocking returns `423 Locked`, and unfinished transcriptions and summaries carry on once you
+unlock. Login cookies are signed with a key derived from the data key, so you stay signed in
+across restarts (subject to auto-lock).
+
+Older installs kept the key in plain text in `.secret_key`. On first start after upgrading, the
+app asks you to create a startup password (and enter your PIN to prove it's you); the existing key
+is wrapped as-is, nothing is re-encrypted, and `.secret_key` is deleted.
+
+Forget the password? **Forgot it? Use your recovery key** on the unlock screen sets a new one.
+Lose both and the data can't be recovered.
 
 The app only listens on `localhost`. Browsers allow the microphone on `localhost`, so recording
 works in any browser on this Mac. Using it from your phone would need HTTPS (e.g. `tailscale
@@ -75,14 +110,18 @@ serve`) and changing the port binding in `docker-compose.yml`.
 
 ## Data and backups
 
-Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), the generated
-key if you didn't set `SECRET_KEY`, and the speech model cache.
+Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), `keyring.json`
+(the wrapped key) and the speech model cache.
 
-- **Settings → PIN & data → Download backup** saves everything, still encrypted. It can only be
-  opened with this app's encryption key, which **Show key** on the same screen reveals after
-  you enter your PIN. Keep the key somewhere safe and separate from the backup.
+- **Settings → PIN & data → Download backup** saves everything, still encrypted, together with
+  the wrapped key. It opens with this app's startup password or recovery key (as they were when
+  the backup was made), or with the raw encryption key, which **Show key** reveals after you
+  enter your PIN and password. Because the wrapped key travels with the backup, a stolen backup
+  is only as safe as your password, so pick a good one.
 - **Load a backup** on the same screen adds the entries, end-of-day summaries and reports from a
-  backup, given the key of the app that made it (leave it empty for this app's own backups).
+  backup, given the startup password, recovery key or encryption key of the app that made it
+  (leave it empty for this app's own backups). Backups made before startup passwords existed
+  need the encryption key.
   That's how you move from the server to the Mac app or back. Nothing already there is
   replaced, loading the same backup twice adds nothing, and your PIN and AI settings stay as they are.
 - **History → Export CSV** gives a spreadsheet of every highlight.

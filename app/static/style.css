@@ -97,6 +97,24 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; color:
 .login-card input { text-align: center; font-size: 1.6rem; letter-spacing: .4em; }
 .brand-mark { display: block; width: 56px; height: 56px; margin: 0 auto; }
 
+/* Startup password */
+.vault-card { max-width: 420px; }
+.vault-card form { text-align: left; }
+.vault-card form label { display: grid; gap: 4px; }
+.vault-card input { text-align: left; font-size: 1rem; letter-spacing: normal; }
+.vault-card .actions { justify-content: flex-start; }
+.link-btn { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-weight: 600; font-size: .92rem; cursor: pointer; }
+.recovery-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.1rem; letter-spacing: .04em;
+  padding: .8rem; border: 1px dashed var(--accent); border-radius: 10px; background: var(--accent-soft);
+  user-select: all; overflow-wrap: anywhere; text-align: center;
+}
+.check-row { display: flex !important; gap: 8px; align-items: flex-start; font-size: .92rem; }
+.check-row input { width: auto; margin-top: .3rem; }
+.strength { font-size: .85rem; margin: 0; color: var(--muted); }
+.strength.bad { color: var(--danger); }
+.strength.ok { color: var(--accent); }
+
 /* Setup */
 .setup { max-width: 640px; margin: 0 auto; padding: calc(28px + env(safe-area-inset-top)) 16px 48px; display: grid; gap: 18px; }
 .setup-intro { text-align: center; display: grid; gap: 8px; }
