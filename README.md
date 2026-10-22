@@ -80,12 +80,8 @@ Keychain item.
 ## Configuration
 
 Nothing is required in `.env`. See [`.env.example`](.env.example) for the optional settings.
-
-`SECRET_KEY` opts out of the startup password: if it's set, it *is* the encryption key and the app
-starts unlocked, with the key sitting in plain text in your environment. Leave it unset unless you
-need unattended restarts. You can switch an existing `SECRET_KEY` install to a startup password in
-**Settings → PIN & data → Startup password**; after that the password wins and you should remove
-`SECRET_KEY` from `.env`.
+The encryption key isn't one of them: it's always protected by the startup password, so the app
+needs the password (or Touch ID in the Mac app) after every restart.
 
 ### How the startup password works
 
@@ -97,9 +93,9 @@ unlocking returns `423 Locked`, and unfinished transcriptions and summaries carr
 unlock. Login cookies are signed with a key derived from the data key, so you stay signed in
 across restarts (subject to auto-lock).
 
-Older installs kept the key in plain text in `.secret_key`. On first start after upgrading, the
-app asks you to create a startup password (and enter your PIN to prove it's you); the existing key
-is wrapped as-is, nothing is re-encrypted, and `.secret_key` is deleted.
+If the data folder has data but no `keyring.json`, the app won't let you create a new password
+(the new key couldn't open the old data): put `keyring.json` back, or start with an empty data
+folder and load a backup.
 
 Forget the password? **Forgot it? Use your recovery key** on the unlock screen sets a new one.
 Lose both and the data can't be recovered.
@@ -115,13 +111,11 @@ Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), `
 
 - **Settings → PIN & data → Download backup** saves everything, still encrypted, together with
   the wrapped key. It opens with this app's startup password or recovery key (as they were when
-  the backup was made), or with the raw encryption key, which **Show key** reveals after you
-  enter your PIN and password. Because the wrapped key travels with the backup, a stolen backup
-  is only as safe as your password, so pick a good one.
+  the backup was made). Because the wrapped key travels with the backup, a stolen backup is only
+  as safe as your password, so pick a good one.
 - **Load a backup** on the same screen adds the entries, end-of-day summaries and reports from a
-  backup, given the startup password, recovery key or encryption key of the app that made it
-  (leave it empty for this app's own backups). Backups made before startup passwords existed
-  need the encryption key.
+  backup, given the startup password or recovery key of the app that made it (leave it empty
+  for this app's own backups). Backups made before startup passwords can't be loaded.
   That's how you move from the server to the Mac app or back. Nothing already there is
   replaced, loading the same backup twice adds nothing, and your PIN and AI settings stay as they are.
 - **History → Export CSV** gives a spreadsheet of every highlight.

@@ -4,10 +4,9 @@ A backup holds the same ciphertext as the database, so it is no more readable th
 itself. Importing decrypts each value with the backup's key and re-encrypts it with this app's
 key, so a backup from the server can be loaded into the Mac app (or the other way round).
 
-Version 1 backups are opened with the source app's raw encryption key. Version 2 backups also
-carry the source app's wrapped data key (see vault.py), so its startup password or recovery key
-opens them; the raw key still works too. An app without a startup password (SECRET_KEY set)
-still writes version 1.
+A backup also carries the source app's wrapped data key (see vault.py), so that app's startup
+password or recovery key opens it. (Version 1 backups, from before startup passwords, needed the
+raw key and are no longer accepted.)
 """
 
 import json
@@ -21,7 +20,6 @@ from .vault import WrongSecret, open_keyring
 
 FORMAT = "brain-dump-backup"
 VERSION = 2
-VERSIONS = (1, 2)
 KEY_CHECK = "brain-dump"
 
 # Columns copied from a backup; anything else in the file is ignored.
@@ -40,20 +38,19 @@ class BackupError(ValueError):
     pass
 
 
-def export_backup(store: Store, keyring: dict | None = None) -> dict:
+def export_backup(store: Store, keyring: dict) -> dict:
     tables = {}
     for table in COLUMNS:
         rows = []
         for row in store.raw_rows(table):
             rows.append({k: (v.decode("ascii") if isinstance(v, bytes) else v) for k, v in row.items()})
         tables[table] = rows
-    extra = {"keyring": keyring} if keyring else {}
     return {
         "format": FORMAT,
-        "version": VERSION if keyring else 1,
+        "version": VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "key_check": store.box.seal(KEY_CHECK).decode("ascii"),
-        **extra,
+        "keyring": keyring,
         **tables,
     }
 
@@ -65,7 +62,9 @@ def _parse(raw: bytes) -> dict:
         raise BackupError("That file isn't a Brain Dump backup.") from exc
     if not isinstance(data, dict) or data.get("format") != FORMAT:
         raise BackupError("That file isn't a Brain Dump backup.")
-    if data.get("version") not in VERSIONS:
+    if data.get("version") == 1:
+        raise BackupError("This backup was made before startup passwords and can't be loaded any more.")
+    if data.get("version") != VERSION or not isinstance(data.get("keyring"), dict):
         raise BackupError("This backup was made by a different version of Brain Dump.")
     return data
 
@@ -86,32 +85,24 @@ def _summary(text: str | None) -> str | None:
 
 
 def _source_box(data: dict, key: str, own_key: str) -> Box:
-    """The Box that opens this backup. `key` is what was typed: for version 1 the source app's
-    encryption key, for version 2 also its startup password or recovery key. Blank means the
-    backup came from this app."""
-    candidates = []
-    if not key:
-        candidates.append(own_key)
-    else:
-        if data.get("version") == 2 and isinstance(data.get("keyring"), dict):
-            try:
-                candidates.append(open_keyring(data["keyring"], key))
-            except WrongSecret:
-                pass
-        candidates.append(key)
-    for secret in candidates:
-        box = Box(secret)
+    """The Box that opens this backup. `key` is the source app's startup password or recovery
+    key, as typed; blank means the backup came from this app."""
+    secret = own_key
+    if key:
         try:
-            if box.open(data["key_check"].encode()) == KEY_CHECK:
-                return box
-        except (KeyError, AttributeError, RuntimeError):
-            continue
-    if data.get("version") == 2:
-        if not key:
-            raise BackupError("This backup came from another copy of Brain Dump. Enter that app's startup "
-                              "password or recovery key.")
-        raise BackupError("That password or key doesn't unlock this backup.")
-    raise BackupError("That key doesn't unlock this backup.")
+            secret = open_keyring(data["keyring"], key)
+        except WrongSecret:
+            raise BackupError("That password or recovery key doesn't unlock this backup.") from None
+    box = Box(secret)
+    try:
+        if box.open(data["key_check"].encode()) == KEY_CHECK:
+            return box
+    except (KeyError, AttributeError, RuntimeError):
+        pass
+    if not key:
+        raise BackupError("This backup came from another copy of Brain Dump. Enter that app's startup "
+                          "password or recovery key.")
+    raise BackupError("The backup file is damaged.")
 
 
 def import_backup(store: Store, raw: bytes, key: str, own_key: str) -> dict:
