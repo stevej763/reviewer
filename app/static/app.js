@@ -324,7 +324,7 @@ async function lockApp() {
   showLogin();
   try {
     // A recording in progress is stopped and finishes saving before the session ends.
-    if (rec.recorder && rec.recorder.state === "recording") stopRecording();
+    if (rec.id && !rec.stopping && rec.recorder?.state !== "inactive") stopRecording();
     while (rec.id) await new Promise((r) => setTimeout(r, 500));
     // Skip signing out if you unlocked again while the recording was saving.
     if ($("#app").hidden) await fetch("/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
@@ -369,6 +369,7 @@ const CHUNK_MS = 10_000;
 const rec = {
   recorder: null, stream: null, started: 0, timer: null, mime: "",
   id: null, seq: 0, queue: [], uploading: false, stopped: false, sent: 0, retryDelay: 0, wakeLock: null,
+  stopping: false, interrupted: "",
 };
 
 function pickMime() {
@@ -392,6 +393,9 @@ function recordingStatus() {
   const waiting = rec.queue.length;
   const saved = `saved up to ${clock(rec.sent * CHUNK_MS)}`;
   if (rec.retryDelay) return `Connection problem, retrying… (${waiting} piece${waiting === 1 ? "" : "s"} waiting)`;
+  if (!rec.stopped && rec.stream?.getAudioTracks().some((t) => t.muted)) {
+    return "The microphone has been muted by your computer, so nothing is being heard. Tap to stop";
+  }
   return rec.stopped ? `Finishing… ${saved}` : `Listening… tap to stop · ${saved}`;
 }
 
@@ -434,7 +438,7 @@ async function startRecording() {
       method: "POST",
       body: { date: $("#entry-date").value || today(), provider: $("#entry-provider").value || null, mime: rec.mime },
     });
-    Object.assign(rec, { id: entry.id, seq: 0, queue: [], sent: 0, stopped: false, retryDelay: 0 });
+    Object.assign(rec, { id: entry.id, seq: 0, queue: [], sent: 0, stopped: false, retryDelay: 0, stopping: false, interrupted: "" });
   } catch (err) {
     rec.stream.getTracks().forEach((t) => t.stop());
     setRecordUI("idle", "Tap to talk about your day");
@@ -445,7 +449,9 @@ async function startRecording() {
   rec.recorder.ondataavailable = (e) => {
     if (e.data.size) { rec.queue.push({ seq: rec.seq++, blob: e.data }); pumpChunks(); }
   };
-  rec.recorder.onstop = () => { rec.stopped = true; pumpChunks(); };
+  rec.recorder.onstop = () => { interrupted(); rec.stopped = true; pumpChunks(); };
+  rec.recorder.onerror = interrupted;
+  for (const track of rec.stream.getAudioTracks()) track.addEventListener("ended", interrupted);
   rec.recorder.start(CHUNK_MS);
   rec.started = Date.now();
   keepAwake();
@@ -457,10 +463,21 @@ async function startRecording() {
 }
 
 function stopRecording() {
+  rec.stopping = true;
   clearInterval(rec.timer);
   setRecordUI("busy", "Finishing…");
-  rec.recorder.stop();  // fires a last dataavailable, then onstop
+  if (rec.recorder.state !== "inactive") rec.recorder.stop();  // fires a last dataavailable, then onstop
   rec.stream.getTracks().forEach((t) => t.stop());
+}
+
+// The recorder can stop without you tapping stop: the microphone is unplugged or switches
+// (AirPods connecting, say), another app takes it, or the system cuts it off. Keep what was
+// recorded and say what happened, rather than leaving the timer running on nothing.
+function interrupted() {
+  if (rec.stopping || !rec.id) return;
+  rec.interrupted = `The recording stopped on its own at ${clock(Date.now() - rec.started)} ` +
+    "(the microphone was cut off or switched). Everything up to then is saved.";
+  stopRecording();
 }
 
 // Sends queued pieces one at a time, in order. A failed piece is retried with backoff
@@ -509,6 +526,7 @@ async function finishRecording() {
     addToLatest(renderSummary(entry, { onChange: loadLatest }));
     setRecordUI("idle", "Saved ✓ Tap to record more");
     toast("Recording saved. Processing in the background");
+    if (rec.interrupted) $("#log-error").textContent = rec.interrupted;
   } catch (err) {
     if (/already been finished/.test(err.message)) {
       rec.id = null;
@@ -525,7 +543,7 @@ async function finishRecording() {
 $("#retry-upload").addEventListener("click", () => { $("#retry-upload").hidden = true; finishRecording(); });
 
 $("#record").addEventListener("click", () => {
-  if (rec.recorder && rec.recorder.state === "recording") stopRecording();
+  if (rec.id && !rec.stopping) stopRecording();
   else if (!rec.id) startRecording();
 });
 
