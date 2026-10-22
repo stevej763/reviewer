@@ -198,8 +198,25 @@ class RecordingFinishIn(BaseModel):
     partial: bool = False  # process what arrived even if pieces are missing
 
 
+class SubmitIn(BaseModel):
+    date: str
+    text: str = Field(min_length=1, max_length=MAX_TEXT_CHARS)
+    provider: str | None = None
+    merged: list[int] = Field(default_factory=list, max_length=50)  # other transcripts folded into this one
+
+    @field_validator("date")
+    @classmethod
+    def _date(cls, v):
+        return _check_date(v)
+
+
 class SummarizeIn(BaseModel):
     provider: str | None = None
+    overwrite: bool = False  # replace highlights you've edited by hand
+
+
+class DaySummaryIn(BaseModel):
+    summary: dict
 
 
 class ReportIn(BaseModel):
@@ -633,7 +650,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     def update_entry(entry_id: int, body: EntryUpdate):
         summary = None
         if body.summary is not None:
-            summary = normalize_summary(body.summary)
+            # Hand-edited highlights are marked, so re-summarising asks before replacing them.
+            summary = {**normalize_summary(body.summary), "edited": True}
         before = store.get_entry(entry_id)
         entry = store.update_entry(entry_id, entry_date=body.date, text=body.text, summary=summary)
         if not entry:
@@ -642,6 +660,28 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             worker.check_day(day)
         return entry
 
+    @app.post("/api/entries/{entry_id}/submit", status_code=202, dependencies=[Depends(require_login)])
+    def submit_transcript(entry_id: int, body: SubmitIn):
+        """Save your checked (and maybe edited) transcript and summarise it. Other transcripts you
+        combined into the same text box are removed, since their words are now in this entry."""
+        entry = store.get_entry(entry_id)
+        if not entry:
+            raise HTTPException(404, "Entry not found")
+        if entry["status"] != "review":
+            raise HTTPException(409, "This recording has already been saved.")
+        if not body.text.strip():
+            raise HTTPException(400, "Say or type something first.")
+        store.update_entry(entry_id, entry_date=body.date, text=body.text.strip())
+        result = queue_summary(entry_id, body.provider or entry["wanted_provider"] or None)
+        days = {entry["date"], body.date}
+        for other_id in set(body.merged) - {entry_id}:
+            other = store.get_entry(other_id)
+            if other and other["status"] == "review" and store.delete_entry(other_id):
+                days.add(other["date"])
+        for day in days:
+            worker.check_day(day)
+        return result
+
     @app.post("/api/entries/{entry_id}/summarize", dependencies=[Depends(require_login)])
     def resummarize(entry_id: int, body: SummarizeIn):
         entry = store.get_entry(entry_id)
@@ -649,6 +689,10 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             raise HTTPException(404, "Entry not found")
         if entry["status"] in ("transcribing", "summarising"):
             raise HTTPException(409, "This entry is still being processed.")
+        if entry["status"] == "review":
+            raise HTTPException(409, "Check the transcript and save it first.")
+        if (entry["summary"] or {}).get("edited") and not body.overwrite:
+            raise HTTPException(409, "You've edited these highlights. Re-summarising would replace your changes.")
         if not entry["text"].strip():
             raise HTTPException(400, "This entry has no text to summarise.")
         return queue_summary(entry_id, body.provider)
@@ -706,8 +750,19 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             raise HTTPException(404, "No end-of-day summary for that date")
         return _day_out(day)
 
+    @app.put("/api/days/{entry_date}", dependencies=[Depends(require_login)])
+    def edit_day(entry_date: str, body: DaySummaryIn):
+        """Save your corrections to an end-of-day summary."""
+        day = store.get_day(entry_date)
+        if not day or not day["summary"]:
+            raise HTTPException(404, "No end-of-day summary for that day.")
+        if day["status"] == "summarising":
+            raise HTTPException(409, "This summary is still being written.")
+        store.save_day(entry_date, status="done", error=None, summary={**normalize_summary(body.summary), "edited": True})
+        return _day_out(store.get_day(entry_date))
+
     @app.post("/api/days/{entry_date}/generate", dependencies=[Depends(require_login)])
-    def generate_day(entry_date: str):
+    def generate_day(entry_date: str, overwrite: bool = False):
         """Build (or rebuild) the end-of-day summary. Only runs when you ask for it."""
         try:
             _check_date(entry_date)
@@ -716,6 +771,9 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
         entries, _ = day_entries(store, entry_date)
         if len(entries) < 2:
             raise HTTPException(400, "An end-of-day summary needs at least two finished entries.")
+        previous = store.get_day(entry_date)
+        if previous and (previous["summary"] or {}).get("edited") and not overwrite:
+            raise HTTPException(409, "You've edited this summary. Rebuilding would replace your changes.")
         store.save_day(entry_date, status="summarising", error=None, entry_count=len(entries))
         worker.enqueue_day(entry_date)
         return _day_out(store.get_day(entry_date))

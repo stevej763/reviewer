@@ -3,6 +3,7 @@
 const $ = (sel) => document.querySelector(sel);
 const state = { providers: [], defaultProvider: null, styles: {} };
 const DRAFT_KEY = "reviewer-draft";
+const DRAFT_IDS_KEY = "reviewer-draft-recordings";
 
 // ---------- helpers ----------
 
@@ -49,7 +50,9 @@ async function api(path, { method = "GET", body, form } = {}) {
     let msg = data && data.detail;
     if (Array.isArray(msg)) msg = msg.map((d) => d.msg).join("; ");
     if (msg && typeof msg === "object") msg = msg.message;
-    throw new Error(msg || `Request failed (${res.status})`);
+    const err = new Error(msg || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -523,9 +526,11 @@ async function finishRecording() {
     const entry = await api(`/api/recordings/${rec.id}/finish`, { method: "POST", body: { chunks: rec.seq } });
     rec.id = null;
     letSleep();
+    draft.awaiting.push(entry.id);
+    saveDraftIds();
     addToLatest(renderSummary(entry, { onChange: loadLatest }));
     setRecordUI("idle", "Saved ✓ Tap to record more");
-    toast("Recording saved. Processing in the background");
+    toast("Recording saved. The transcript will appear in the text box for you to check");
     if (rec.interrupted) $("#log-error").textContent = rec.interrupted;
   } catch (err) {
     if (/already been finished/.test(err.message)) {
@@ -550,6 +555,55 @@ $("#record").addEventListener("click", () => {
 // ---------- entries ----------
 
 const PENDING = { transcribing: "Transcribing your recording…", summarising: "Writing your highlights…" };
+
+// ----- transcripts waiting for you to check them -----
+//
+// A recording is transcribed, then waits (status "review") until you've read and corrected
+// the words. Transcripts recorded on this page drop into the text box by themselves; any
+// other one has a "Check and save" button. The text box remembers which transcripts it holds,
+// so saving turns them into one entry (and a reload keeps the link).
+const draft = { ids: [], awaiting: [] };
+
+function saveDraftIds() {
+  try { localStorage.setItem(DRAFT_IDS_KEY, JSON.stringify(draft)); } catch { /* storage unavailable */ }
+}
+
+function saveDraftText() {
+  try { localStorage.setItem(DRAFT_KEY, $("#entry-text").value); } catch { /* storage unavailable */ }
+}
+
+function showDraftHint() {
+  $("#review-hint").hidden = !draft.ids.length;
+}
+
+// Puts a transcript into the text box (after anything already there) for you to check.
+function takeTranscript(entry, { focus = false } = {}) {
+  draft.awaiting = draft.awaiting.filter((id) => id !== entry.id);
+  if (!draft.ids.includes(entry.id)) {
+    const box = $("#entry-text");
+    if (!box.value.trim()) $("#entry-date").value = entry.date;
+    box.value = [box.value.trimEnd(), entry.text.trim()].filter(Boolean).join("\n\n");
+    draft.ids.push(entry.id);
+    saveDraftText();
+  }
+  saveDraftIds();
+  showDraftHint();
+  document.querySelectorAll(`.entry[data-entry-id="${entry.id}"]`).forEach((card) =>
+    card.replaceWith(renderSummary(entry, card._opts)));
+  if (focus) {
+    if ($("#view-log").hidden) showView("log");
+    const box = $("#entry-text");
+    box.scrollIntoView({ behavior: "smooth", block: "center" });
+    box.focus();
+  }
+}
+
+function forgetTranscript(id) {
+  draft.ids = draft.ids.filter((x) => x !== id);
+  draft.awaiting = draft.awaiting.filter((x) => x !== id);
+  saveDraftIds();
+  showDraftHint();
+}
 
 function summaryParts(s) {
   const parts = [];
@@ -578,13 +632,14 @@ function renderDay(day, date, entryCount) {
   const count = day && !day.stale ? day.entry_count : entryCount ?? day?.entry_count;
   card.append(el("div", { class: "entry-head" },
     el("span", { class: "day-label" }, "End of day"),
-    el("span", { class: "entry-meta" }, `${prettyDate(date)} · ${count} entries`)));
+    el("span", { class: "entry-meta" }, `${prettyDate(date)} · ${count} entries${day?.summary?.edited ? " · edited by you" : ""}`)));
 
   const generate = (label, primary) => el("button", {
     class: primary ? "btn primary" : "btn",
     onclick: async (e) => {
+      if (day?.summary?.edited && !confirm(EDITED_WARNING.replace("these highlights", "this summary"))) return;
       await busy(e.currentTarget, "Starting…", async () => {
-        try { card.replaceWith(renderDay(await api(`/api/days/${date}/generate`, { method: "POST" }))); }
+        try { card.replaceWith(renderDay(await api(`/api/days/${date}/generate?overwrite=true`, { method: "POST" }))); }
         catch (err) { toast(err.message); }
       });
     },
@@ -617,7 +672,12 @@ function renderDay(day, date, entryCount) {
   if (day.summary) card.append(...summaryParts(day.summary));
   if (!busyNow) {
     card.append(el("div", { class: "entry-actions" },
-      day.status === "failed" ? generate("Try again", true) : day.stale ? generate("Update summary", true) : generate("Rebuild")));
+      day.status === "failed" ? generate("Try again", true) : day.stale ? generate("Update summary", true) : generate("Rebuild"),
+      day.summary ? el("button", {
+        class: "btn",
+        onclick: () => summaryEditor(day.summary, card, async (summary) =>
+          renderDay(await api(`/api/days/${date}`, { method: "PUT", body: { summary } }))),
+      }, "Edit") : null));
   }
   return card;
 }
@@ -638,7 +698,9 @@ function renderSummary(entry, { onChange } = {}) {
   const s = entry.summary;
   const card = el("article", { class: "card entry", "data-entry-id": entry.id, "data-status": entry.status });
   card._opts = { onChange };
-  const meta = PENDING[entry.status] ? "processing" : entry.provider ? `${entry.provider} · ${entry.model}` : "not summarised";
+  const meta = PENDING[entry.status] ? "processing" : entry.status === "review" ? "waiting for you to check"
+    : s?.edited ? "edited by you"
+    : entry.provider ? `${entry.provider} · ${entry.model}` : "not summarised";
   card.append(el("div", { class: "entry-head" },
     el("span", { class: "entry-date" }, prettyDate(entry.date)),
     el("span", { class: "entry-meta" }, meta)));
@@ -680,6 +742,18 @@ function renderSummary(entry, { onChange } = {}) {
         }, "Process what was saved")));
     }
   }
+  if (entry.status === "review") {
+    if (draft.ids.includes(entry.id)) {
+      card.append(el("div", { class: "processing" },
+        el("b", {}, "In the text box above. Check it, fix anything, then press Summarise & save.")));
+    } else {
+      const preview = entry.text.length > 240 ? `${entry.text.slice(0, 240).trimEnd()}…` : entry.text;
+      card.append(el("div", { class: "warn review" },
+        el("div", {}, el("b", {}, "Transcribed and saved. "), "Check the words before it's summarised:"),
+        el("p", { class: "transcript-preview" }, preview),
+        el("button", { class: "btn small primary", onclick: () => takeTranscript(entry, { focus: true }) }, "Check and save")));
+    }
+  }
   if (entry.status === "failed") {
     card.append(el("div", { class: "warn" }, el("div", {}, entry.error || "Something went wrong."),
       el("button", {
@@ -697,35 +771,47 @@ function renderSummary(entry, { onChange } = {}) {
 
   if (s) card.append(...summaryParts(s));
 
-  if (entry.text) card.append(el("details", {}, el("summary", {}, "What you said"), el("pre", {}, entry.text)));
+  if (entry.text && entry.status !== "review") {
+    card.append(el("details", {}, el("summary", {}, "What you said"), el("pre", {}, entry.text)));
+  }
 
   const actions = el("div", { class: "entry-actions" });
   const busyNow = Boolean(PENDING[entry.status]);
-  if (state.providers.length && !busyNow && entry.text) {
+  const reviewing = entry.status === "review";
+  if (state.providers.length && !busyNow && !reviewing && entry.text) {
     for (const p of state.providers) {
       actions.append(el("button", {
         class: "btn",
         onclick: async (e) => {
+          if (s?.edited && !confirm(EDITED_WARNING)) return;
           try {
-            const updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: p.name } });
+            const updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: p.name, overwrite: true } });
             card.replaceWith(renderSummary(updated, { onChange }));
           } catch (err) { toast(err.message); }
         },
       }, state.providers.length > 1 ? `Redo with ${p.name === "claude" ? "Claude" : "Ollama"}` : "Redo summary"));
     }
   }
-  if (!busyNow && entry.text) {
+  if (!busyNow && s) {
+    actions.append(el("button", {
+      class: "btn",
+      onclick: () => summaryEditor(s, card, async (summary) =>
+        renderSummary(await api(`/api/entries/${entry.id}`, { method: "PUT", body: { summary } }), { onChange })),
+    }, "Edit highlights"));
+  }
+  if (!busyNow && !reviewing && entry.text) {
     actions.append(el("button", {
       class: "btn",
       onclick: () => editEntry(entry, card, onChange),
-    }, "Edit"));
+    }, s ? "Edit what you said" : "Edit"));
   }
   actions.append(el("button", {
     class: "btn danger",
     onclick: async () => {
-      if (!confirm("Delete this entry permanently?")) return;
+      if (!confirm(reviewing ? "Delete this recording's transcript permanently?" : "Delete this entry permanently?")) return;
       try {
         await api(`/api/entries/${entry.id}`, { method: "DELETE" });
+        forgetTranscript(entry.id);
         card.remove();
         toast("Deleted");
         onChange && onChange();
@@ -809,6 +895,10 @@ function watchPending() {
         if (entry.status !== card.dataset.status) {
           card.replaceWith(renderSummary(entry, card._opts));
           entryFinished = true;
+          if (entry.status === "review" && draft.awaiting.includes(entry.id)) {
+            takeTranscript(entry);
+            toast("Transcript ready. Check it in the text box, then save");
+          }
           if (entry.status === "done") toast("Highlights ready");
           if (entry.status === "failed") toast("An entry couldn't be processed");
         }
@@ -818,6 +908,65 @@ function watchPending() {
     if (entryFinished && !$("#view-log").hidden) await refreshDayCard();
     if (document.querySelector('.entry[data-status="transcribing"], .entry[data-status="summarising"]')) watchPending();
   }, 2000);
+}
+
+// ----- editing highlights by hand -----
+//
+// Fix wording or add what the model missed. Edited highlights are marked, and re-summarising
+// asks before replacing them.
+
+const CATEGORIES = ["delivery", "problem-solving", "collaboration", "leadership", "mentoring", "communication",
+  "process-improvement", "customer", "learning", "admin", "other"];
+const LIST_FIELDS = [["wins", "Wins"], ["projects", "Projects"], ["people", "People"],
+  ["challenges", "Challenges"], ["follow_ups", "Follow-ups"], ["tags", "Tags"]];
+const EDITED_WARNING = "You've edited these highlights by hand. Re-writing them will replace your changes. Carry on?";
+
+// Builds the editor. `save(summary)` stores it and returns the card to show afterwards.
+function summaryEditor(summary, card, save) {
+  const s = summary || {};
+  const headline = el("input", { type: "text", value: s.headline || "" });
+  const rows = el("div", { class: "hl-rows" });
+  const addRow = (h = {}) => {
+    const category = el("select", { "aria-label": "Category" },
+      CATEGORIES.map((c) => el("option", { value: c, selected: c === (h.category || "other") }, c)));
+    const text = el("textarea", { rows: 3, "aria-label": "Highlight", placeholder: "What you did" });
+    text.value = h.text || "";
+    const impact = el("input", { type: "text", "aria-label": "Impact", placeholder: "Impact (optional)", value: h.impact || "" });
+    const row = el("div", { class: "hl-row" }, el("div", { class: "hl-row-head" }, category,
+      el("button", { class: "btn small", type: "button", onclick: () => row.remove() }, "Remove")), text, impact);
+    row._value = () => ({ category: category.value, text: text.value.trim(), impact: impact.value.trim() });
+    rows.append(row);
+    return text;
+  };
+  (s.highlights || []).forEach((h) => addRow(h));
+  const lists = LIST_FIELDS.map(([key, label]) => {
+    const box = el("textarea", { rows: 2, placeholder: "One per line" });
+    box.value = (s[key] || []).join("\n");
+    return [key, label, box];
+  });
+  const editor = el("article", { class: "card summary-editor" },
+    el("label", {}, "Headline", headline),
+    el("div", { class: "hl-label" }, "Highlights"), rows,
+    el("button", { class: "btn small", type: "button", onclick: () => addRow().focus() }, "+ Add a highlight"),
+    lists.map(([, label, box]) => el("label", {}, label, box)),
+    el("div", { class: "actions" },
+      el("button", { class: "btn", onclick: () => editor.replaceWith(card) }, "Cancel"),
+      el("button", {
+        class: "btn primary",
+        onclick: async (e) => {
+          const out = { headline: headline.value.trim(),
+            highlights: [...rows.children].map((r) => r._value()).filter((h) => h.text) };
+          for (const [key, , box] of lists) out[key] = box.value.split("\n").map((v) => v.trim()).filter(Boolean);
+          await busy(e.currentTarget, "Saving…", async () => {
+            try {
+              editor.replaceWith(await save(out));
+              toast("Highlights saved");
+            } catch (err) { toast(err.message); }
+          });
+        },
+      }, "Save highlights")));
+  card.replaceWith(editor);
+  headline.focus();
 }
 
 function editEntry(entry, card, onChange) {
@@ -835,8 +984,10 @@ function editEntry(entry, card, onChange) {
           await busy(e.currentTarget, "Saving…", async () => {
             try {
               let updated = await api(`/api/entries/${entry.id}`, { method: "PUT", body: { date: date.value, text: text.value } });
-              if (text.value !== entry.text && state.providers.length) {
-                updated = await api(`/api/entries/${entry.id}/summarize`, { method: "POST", body: { provider: entry.provider || state.defaultProvider } });
+              if (text.value !== entry.text && state.providers.length &&
+                  (!entry.summary?.edited || confirm(EDITED_WARNING.replace("Carry on?", "Re-write them from the new text?")))) {
+                updated = await api(`/api/entries/${entry.id}/summarize`, {
+                  method: "POST", body: { provider: entry.provider || state.defaultProvider, overwrite: true } });
               }
               editor.replaceWith(renderSummary(updated, { onChange }));
               toast(updated.status === "summarising" ? "Saved. Updating highlights…" : "Saved");
@@ -853,12 +1004,25 @@ $("#save-entry").addEventListener("click", async (e) => {
   if (!text) { $("#log-error").textContent = "Say or type something first."; return; }
   await busy(e.currentTarget, "Saving…", async () => {
     try {
-      const entry = await api("/api/entries", {
-        method: "POST",
-        body: { date: $("#entry-date").value || today(), text, provider: $("#entry-provider").value || null },
-      });
+      const body = { date: $("#entry-date").value || today(), text, provider: $("#entry-provider").value || null };
+      let entry = null;
+      if (draft.ids.length) {
+        // The text holds checked transcripts: save it as the first of them, folding in the rest.
+        const [first, ...rest] = draft.ids;
+        try {
+          entry = await api(`/api/entries/${first}/submit`, { method: "POST", body: { ...body, merged: rest } });
+          rest.forEach((id) => document.querySelectorAll(`.entry[data-entry-id="${id}"]`).forEach((c) => c.remove()));
+        } catch (err) {
+          if (err.status !== 404 && err.status !== 409) throw err;  // gone or saved elsewhere: save the text as new
+        }
+      }
+      if (!entry) entry = await api("/api/entries", { method: "POST", body });
       $("#entry-text").value = "";
       try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
+      draft.ids = [];
+      saveDraftIds();
+      showDraftHint();
+      document.querySelectorAll(`.entry[data-entry-id="${entry.id}"]`).forEach((c) => c.remove());
       addToLatest(renderSummary(entry, { onChange: loadLatest }));
       toast("Saved. Writing highlights in the background");
     } catch (err) {
@@ -869,7 +1033,14 @@ $("#save-entry").addEventListener("click", async (e) => {
 
 // Keep unsent text if the page reloads or the phone kills the tab.
 $("#entry-text").addEventListener("input", (e) => {
-  try { localStorage.setItem(DRAFT_KEY, e.target.value); } catch { /* storage unavailable */ }
+  saveDraftText();
+  // Emptying the box lets go of its transcripts; they stay saved, each with a "Check and save" button.
+  if (!e.target.value.trim() && draft.ids.length) {
+    draft.ids = [];
+    saveDraftIds();
+    showDraftHint();
+    loadLatest();
+  }
 });
 
 // The selected day's entries, so you can see what's still processing when you come back.
@@ -879,6 +1050,8 @@ async function loadLatest() {
     const [entries, days] = await Promise.all([api(`/api/entries?start=${day}&end=${day}`), fetchDays(day, day)]);
     const dayCard = dayCardFor(day, days, entries);
     $("#latest").replaceChildren(...(dayCard ? [dayCard] : []), ...entries.map((e) => renderSummary(e, { onChange: loadLatest })));
+    // Recorded here, then transcribed while the page was closed: into the text box it goes.
+    entries.filter((e) => e.status === "review" && draft.awaiting.includes(e.id)).forEach((e) => takeTranscript(e));
   } catch { /* shown elsewhere */ }
 }
 
@@ -1380,6 +1553,10 @@ $("#import-backup").addEventListener("click", async (e) => {
 // ---------- start ----------
 
 $("#entry-date").value = today();
-try { $("#entry-text").value = localStorage.getItem(DRAFT_KEY) || ""; } catch { /* ignore */ }
+try {
+  $("#entry-text").value = localStorage.getItem(DRAFT_KEY) || "";
+  Object.assign(draft, JSON.parse(localStorage.getItem(DRAFT_IDS_KEY) || "{}"));
+} catch { /* ignore */ }
+showDraftHint();
 setRange("month");
 boot().catch((err) => { document.body.prepend(el("p", { class: "error" }, err.message)); });
