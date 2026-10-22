@@ -59,11 +59,14 @@ class PinAuth:
     def issue_token(self) -> str:
         return self._serializer.dumps({"epoch": self._epoch()})
 
-    def is_valid(self, token: str | None) -> bool:
+    def is_valid(self, token: str | None, idle_seconds: int = 0) -> bool:
+        """`idle_seconds` > 0 also rejects a token that hasn't been refreshed (see issue_token)
+        within that long, which is how auto-lock is enforced on the server."""
         if not token:
             return False
+        max_age = min(self.max_age, idle_seconds) if idle_seconds > 0 else self.max_age
         try:
-            data = self._serializer.loads(token, max_age=self.max_age)
+            data = self._serializer.loads(token, max_age=max_age)
         except (BadSignature, SignatureExpired):
             return False
         return isinstance(data, dict) and bool(data.get("epoch")) and data["epoch"] == self._epoch()

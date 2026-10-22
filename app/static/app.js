@@ -28,7 +28,9 @@ async function api(path, { method = "GET", body, form } = {}) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opts);
+  idle.busy++;  // a long request (like writing a report) counts as using the app
+  let res;
+  try { res = await fetch(path, opts); } finally { idle.busy--; }
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
   if (res.status === 409 && data && data.detail === "Finish setting up the app first.") {
@@ -96,6 +98,7 @@ function showLogin() {
 
 async function refreshSession() {
   const s = await api("/api/session");
+  if (s.authenticated) idle.minutes = s.auto_lock_minutes ?? 5;
   state.providers = s.providers || [];
   state.defaultProvider = s.default_provider;
   state.styles = s.report_styles;
@@ -114,6 +117,7 @@ async function boot() {
   $("#login").hidden = true;
   $("#setup").hidden = true;
   $("#app").hidden = false;
+  markActive(true);
   $("#rep-style").replaceChildren(...Object.entries(state.styles).map(([k, v]) => el("option", { value: k }, v)));
   showView(location.hash.slice(1) || "log");
 }
@@ -130,10 +134,58 @@ $("#login-form").addEventListener("submit", async (e) => {
   }
 });
 
-$("#logout").addEventListener("click", async () => {
-  await api("/api/logout", { method: "POST" });
+$("#logout").addEventListener("click", () => lockApp());
+
+// ---------- auto-lock ----------
+//
+// After a few minutes with no taps, clicks, scrolling or typing (Settings → PIN & data) the
+// app locks and asks for the PIN again. The server enforces the same limit: the session
+// cookie is only refreshed while you're active, so a tab left open or reopened later can't
+// skip the PIN. A recording or a slow request (like writing a report) counts as activity.
+
+const ACTIVE_KEY = "braindump-last-active";
+const idle = { minutes: 5, last: Date.now(), refreshed: 0, busy: 0, locking: false };
+
+function markActive(force = false) {
+  const now = Date.now();
+  if (!force && now - idle.last < 1000) return;  // pointermove fires constantly
+  idle.last = now;
+  try { localStorage.setItem(ACTIVE_KEY, String(now)); } catch { /* ignore */ }  // other tabs see it
+  // Tell the server, at most every minute (more often for very short limits).
+  const every = Math.min(60_000, (idle.minutes || 60) * 15_000);
+  if ($("#app").hidden || (!force && now - idle.refreshed < every)) return;
+  idle.refreshed = now;
+  fetch("/api/session/active", { method: "POST", credentials: "same-origin" }).catch(() => {});
+}
+
+function checkIdle() {
+  if (rec.id || idle.busy) return markActive();
+  if ($("#app").hidden || !idle.minutes) return;
+  let last = idle.last;
+  try { last = Math.max(last, Number(localStorage.getItem(ACTIVE_KEY)) || 0); } catch { /* ignore */ }
+  if (Date.now() - last >= idle.minutes * 60_000) lockApp();
+}
+
+async function lockApp() {
+  if (idle.locking) return;
+  idle.locking = true;
   showLogin();
-});
+  try {
+    // A recording in progress is stopped and finishes saving before the session ends.
+    if (rec.recorder && rec.recorder.state === "recording") stopRecording();
+    while (rec.id) await new Promise((r) => setTimeout(r, 500));
+    // Skip signing out if you unlocked again while the recording was saving.
+    if ($("#app").hidden) await fetch("/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+  } finally { idle.locking = false; }
+}
+window.braindumpLock = lockApp;  // the Mac app calls this when its window is closed
+
+for (const type of ["pointerdown", "pointermove", "keydown", "wheel", "touchstart", "scroll"]) {
+  document.addEventListener(type, () => markActive(), { capture: true, passive: true });
+}
+setInterval(checkIdle, 15_000);
+// Timers don't run while a phone is locked or a laptop sleeps, so check straight away on return.
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkIdle(); });
 
 // ---------- navigation ----------
 
@@ -1063,7 +1115,10 @@ async function loadSettings(tab = settingsTab) {
   });
   $("#settings-security").hidden = settingsTab !== "security";
   $("#settings-form").hidden = settingsTab === "security";
-  if (settingsTab === "security") return;
+  if (settingsTab === "security") {
+    $("#auto-lock").value = String(idle.minutes);
+    return;
+  }
   try {
     const cfg = await api("/api/settings");
     $("#settings-form").replaceChildren(settingsForm(cfg, {
@@ -1084,6 +1139,19 @@ $("#change-pin").addEventListener("click", async (e) => {
       toast("PIN changed");
     } catch (err) { $("#pin-error").textContent = err.message; }
   });
+});
+
+$("#auto-lock").addEventListener("change", async (e) => {
+  const minutes = Number(e.currentTarget.value);
+  try {
+    await api("/api/settings", { method: "PUT", body: { security: { auto_lock_minutes: minutes } } });
+    idle.minutes = minutes;
+    markActive(true);
+    toast(minutes ? `Locks after ${minutes} minute${minutes === 1 ? "" : "s"} of inactivity` : "Auto-lock turned off");
+  } catch (err) {
+    e.currentTarget.value = String(idle.minutes);
+    toast(err.message);
+  }
 });
 
 $("#show-key").addEventListener("click", async (e) => {

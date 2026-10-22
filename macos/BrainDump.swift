@@ -174,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrameAutosaveName("Main")
         if window.frame.origin == .zero { window.center() }
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -246,6 +247,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func isLocal(_ url: URL?) -> Bool {
         guard let url else { return false }
         return url.scheme == "about" || (url.host == "127.0.0.1" && url.port == Int(port))
+    }
+}
+
+// MARK: - Window behaviour
+
+extension AppDelegate: NSWindowDelegate {
+    // Closing the window keeps the app (and any recording that's still saving) running, but
+    // locks it, so reopening it asks for the PIN.
+    func windowWillClose(_ notification: Notification) {
+        webView.evaluateJavaScript("window.braindumpLock && window.braindumpLock()", completionHandler: nil)
     }
 }
 

@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import backup, reports
-from .appconfig import PROVIDERS, AppConfig, hash_pin
+from .appconfig import AUTO_LOCK_MINUTES, PROVIDERS, AppConfig, hash_pin
 from .auth import COOKIE_NAME, PinAuth
 from .config import Settings, load_settings
 from .crypto import Box
@@ -93,6 +93,17 @@ class SpeechIn(BaseModel):
         return v
 
 
+class SecurityIn(BaseModel):
+    auto_lock_minutes: int = 5
+
+    @field_validator("auto_lock_minutes")
+    @classmethod
+    def _minutes(cls, v):
+        if v not in AUTO_LOCK_MINUTES:
+            raise ValueError(f"auto-lock must be one of {', '.join(map(str, AUTO_LOCK_MINUTES))} minutes")
+        return v
+
+
 class SetupIn(BaseModel):
     profile: ProfileIn
     pin: str
@@ -109,6 +120,7 @@ class SettingsIn(BaseModel):
     profile: ProfileIn | None = None
     ai: AiIn | None = None
     speech: SpeechIn | None = None
+    security: SecurityIn | None = None
 
 
 class PinChangeIn(BaseModel):
@@ -244,10 +256,15 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     async def provider_error(_request: Request, exc: ProviderError):
         return JSONResponse({"detail": str(exc)}, status_code=502)
 
+    def logged_in(request: Request) -> bool:
+        # The cookie is refreshed while you use the app (POST /api/session/active), so one
+        # that's older than the auto-lock time means nobody has touched the app since.
+        return auth.is_valid(request.cookies.get(COOKIE_NAME), config.auto_lock_seconds())
+
     def require_login(request: Request):
         if not config.is_setup:
             raise HTTPException(409, "Finish setting up the app first.")
-        if not auth.is_valid(request.cookies.get(COOKIE_NAME)):
+        if not logged_in(request):
             raise HTTPException(401, "Not logged in")
 
     def pick_provider(name: str | None) -> Provider:
@@ -271,7 +288,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
     @app.get("/api/session")
     def session(request: Request):
         setup_done = config.is_setup
-        authenticated = setup_done and auth.is_valid(request.cookies.get(COOKIE_NAME))
+        authenticated = setup_done and logged_in(request)
         info = {
             "setup_required": not setup_done,
             "authenticated": authenticated,
@@ -285,7 +302,14 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             info["providers"] = [{"name": p.name, "model": p.model} for p in current_providers().values()]
             info["default_provider"] = default_provider()
             info["name"] = config.get()["profile"]["name"]
+            info["auto_lock_minutes"] = config.get()["security"]["auto_lock_minutes"]
         return info
+
+    @app.post("/api/session/active", dependencies=[Depends(require_login)])
+    def still_active(response: Response):
+        """The app calls this while you're using it, to push back the auto-lock."""
+        set_session_cookie(response, auth.issue_token())
+        return {"ok": True}
 
     # ---- first-time setup and settings ------------------------------------
 
@@ -317,6 +341,8 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             changes["ai"] = ai
         if body.speech:
             changes["speech"] = body.speech.model_dump()
+        if body.security:
+            changes["security"] = body.security.model_dump()
         config.update(changes)
         return config.public()
 

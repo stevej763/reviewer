@@ -142,6 +142,22 @@
       <div id="settings-form"></div>
       <div id="settings-security" class="view" hidden>
       <div class="card">
+        <h2>Auto-lock</h2>
+        <label>Ask for the PIN again after
+          <select id="auto-lock">
+            <option value="1">1 minute</option>
+            <option value="2">2 minutes</option>
+            <option value="5">5 minutes</option>
+            <option value="10">10 minutes</option>
+            <option value="15">15 minutes</option>
+            <option value="30">30 minutes</option>
+            <option value="60">1 hour</option>
+            <option value="0">Never</option>
+          </select>
+        </label>
+        <p class="muted small">Counts time with no taps, clicks or typing. A recording in progress never locks. In the Mac app, closing the window also locks it.</p>
+      </div>
+      <div class="card">
         <h2>Change PIN</h2>
         <div class="grid2">
           <label>Current PIN <input id="pin-current" type="password" inputmode="numeric" autocomplete="current-password"></label>

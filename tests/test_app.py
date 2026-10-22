@@ -157,6 +157,30 @@ def test_requires_login(make_client):
     assert c.get("/api/entries").status_code == 401
 
 
+def test_auto_lock_after_inactivity(client, monkeypatch):
+    from itsdangerous.timed import TimestampSigner
+    now = {"t": TimestampSigner.get_timestamp(None)}
+    monkeypatch.setattr(TimestampSigner, "get_timestamp", lambda self: now["t"])
+    client.post("/api/login", json={"pin": PIN})
+    assert client.get("/api/session").json()["auto_lock_minutes"] == 5  # the default
+
+    now["t"] += 4 * 60
+    assert client.post("/api/session/active").status_code == 200  # using the app pushes it back
+    now["t"] += 4 * 60
+    assert client.get("/api/entries").status_code == 200
+    now["t"] += 2 * 60  # 6 minutes since the app was last used
+    assert client.get("/api/entries").status_code == 401
+    assert not client.get("/api/session").json()["authenticated"]
+    assert client.post("/api/session/active").status_code == 401  # can't revive a locked session
+
+    client.post("/api/login", json={"pin": PIN})
+    assert client.put("/api/settings", json={"security": {"auto_lock_minutes": 7}}).status_code == 422
+    assert client.put("/api/settings", json={"security": {"auto_lock_minutes": 0}}).status_code == 200
+    now["t"] += 3 * 3600  # "Never" still ends at the normal session length
+    assert client.get("/api/entries").status_code == 200
+    assert client.get("/api/session").json()["auto_lock_minutes"] == 0
+
+
 def test_lockout_escalates_and_blocks_correct_pin():
     now = [0.0]
     auth = PinAuth(lambda p: p == "1234", lambda: "epoch", "s", 30, max_attempts=3, lockout_minutes=1,

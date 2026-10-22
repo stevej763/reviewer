@@ -9,6 +9,7 @@ page or a CSV spreadsheet.
 - **Everything stays on your Mac.** Speech is transcribed in the container (faster-whisper) and the audio is thrown away. Summaries and reports come from a local model in Ollama, running natively on your Mac.
 - **First-time setup in the app**: your name, role and goals (used to tailor summaries and reports), a PIN, and which AI model to use. Change any of it later in Settings.
 - **PIN login** stored as a salted scrypt hash, with an escalating lockout after wrong guesses. Entries, reports and settings are encrypted at rest.
+- **Auto-lock**: asks for the PIN again after 5 minutes of inactivity (change it in Settings → PIN & data). The Mac app also locks when you close its window.
 - **Claude is optional.** Add an Anthropic API key in Settings if you have one. (A Claude.ai or Claude Code subscription doesn't include an API key.)
 
 ## Setup on a Mac
