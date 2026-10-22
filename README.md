@@ -78,7 +78,13 @@ serve`) and changing the port binding in `docker-compose.yml`.
 Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), the generated
 key if you didn't set `SECRET_KEY`, and the speech model cache.
 
-- **Settings → Download backup** gives you everything decrypted as JSON.
+- **Settings → PIN & data → Download backup** saves everything, still encrypted. It can only be
+  opened with this app's encryption key, which **Show key** on the same screen reveals after
+  you enter your PIN. Keep the key somewhere safe and separate from the backup.
+- **Load a backup** on the same screen adds the entries, end-of-day summaries and reports from a
+  backup, given the key of the app that made it (leave it empty for this app's own backups).
+  That's how you move from the server to the Mac app or back. Nothing already there is
+  replaced, loading the same backup twice adds nothing, and your PIN and AI settings stay as they are.
 - **History → Export CSV** gives a spreadsheet of every highlight.
 
 If you forget your PIN, stop the app and delete the volume to start over

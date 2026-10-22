@@ -153,11 +153,34 @@
       </div>
       <div class="card">
         <h2>Your data</h2>
-        <p class="muted small">Everything is stored encrypted on this machine. Download a full copy any time.</p>
+        <p class="muted small">Everything is stored encrypted on this machine. The backup stays encrypted too, so keep your encryption key somewhere safe: without it the backup can't be opened.</p>
         <div class="exports">
-          <a class="btn small" href="/api/export/backup.json">Download backup (JSON)</a>
+          <a class="btn small" href="/api/export/backup.json">Download backup</a>
           <a class="btn small" href="/api/export/highlights.csv">All highlights (CSV)</a>
         </div>
+      </div>
+      <div class="card">
+        <h2>Encryption key</h2>
+        <p class="muted small">You need this key to load a backup from this app somewhere else, such as moving from your server to the Mac app.</p>
+        <div class="grid2">
+          <label>PIN <input id="key-pin" type="password" inputmode="numeric" autocomplete="current-password"></label>
+        </div>
+        <div class="actions"><button id="show-key" class="btn">Show key</button></div>
+        <div id="key-box" hidden>
+          <label>Encryption key <input id="key-value" type="text" readonly spellcheck="false"></label>
+          <div class="actions"><button id="copy-key" class="btn small">Copy</button></div>
+        </div>
+        <p id="key-error" class="error" role="alert"></p>
+      </div>
+      <div class="card">
+        <h2>Load a backup</h2>
+        <p class="muted small">Adds the entries, end-of-day summaries and reports from a backup. Anything already here is kept, and your PIN and AI settings don't change.</p>
+        <label>Backup file <input id="import-file" type="file" accept=".json,application/json"></label>
+        <label>Encryption key of the app that made it <input id="import-key" type="password" autocomplete="off" spellcheck="false"></label>
+        <p class="muted small">Leave the key empty if the backup came from this app.</p>
+        <div class="actions"><button id="import-backup" class="btn">Load backup</button></div>
+        <p id="import-result" class="muted small" role="status"></p>
+        <p id="import-error" class="error" role="alert"></p>
       </div>
       </div>
     </section>
