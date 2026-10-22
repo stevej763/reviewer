@@ -83,6 +83,24 @@ class Store:
         finally:
             conn.close()
 
+    # ---- raw rows, for encrypted backups ----------------------------------
+
+    BACKUP_TABLES = ("entries", "day_summaries", "reports", "settings")
+
+    def raw_rows(self, table: str) -> list[dict]:
+        """Rows exactly as stored, so encrypted columns stay encrypted."""
+        assert table in self.BACKUP_TABLES
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+
+    def insert_rows(self, table: str, rows: list[dict]) -> None:
+        assert table in self.BACKUP_TABLES
+        with self._conn() as conn:
+            for row in rows:
+                cols = ", ".join(row)
+                marks = ", ".join("?" for _ in row)
+                conn.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", list(row.values()))
+
     # ---- settings ------------------------------------------------------
 
     def get_setting(self, key: str) -> dict | None:

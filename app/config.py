@@ -34,7 +34,7 @@ def _load_or_create_secret(data_dir: Path) -> str:
     value = secrets.token_urlsafe(48)
     path.write_text(value)
     path.chmod(0o600)
-    print(f"[reviewer] Generated an encryption key at {path}. Back it up with your database.")
+    print(f"[braindump] Generated an encryption key at {path}. Back it up with your database.")
     return value
 
 

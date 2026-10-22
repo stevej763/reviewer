@@ -8,9 +8,9 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from . import reports
+from . import backup, reports
 from .appconfig import PROVIDERS, AppConfig, hash_pin
 from .auth import COOKIE_NAME, PinAuth
 from .config import Settings, load_settings
@@ -23,11 +23,12 @@ from .prompts import REPORT_STYLES
 from .transcribe import MODELS as SPEECH_MODELS
 from .transcribe import Transcriber
 
-log = logging.getLogger("reviewer")
+log = logging.getLogger("braindump")
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_AUDIO_BYTES = 50 * 1024 * 1024
 MAX_CHUNK_BYTES = 10 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
+MAX_BACKUP_BYTES = 200 * 1024 * 1024
 
 
 def _check_date(value: str) -> str:
@@ -118,6 +119,10 @@ class PinChangeIn(BaseModel):
     @classmethod
     def _pin(cls, v):
         return _check_pin(v)
+
+
+class KeyIn(BaseModel):
+    pin: str = Field(max_length=64)
 
 
 class OllamaIn(BaseModel):
@@ -216,7 +221,7 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
             return preferred
         return next(iter(available), None)
 
-    app = FastAPI(title="Reviewer", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Brain Dump", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -631,8 +636,38 @@ def create_app(settings: Settings | None = None, providers: dict[str, Provider] 
 
     @app.get("/api/export/backup.json", dependencies=[Depends(require_login)])
     def export_backup():
-        payload = {"entries": store.list_entries(), "reports": [store.get_report(r["id"]) for r in store.list_reports()]}
-        return _download(json.dumps(payload, indent=2).encode(), "reviewer-backup.json", "application/json")
+        # Still encrypted: opening it needs this app's encryption key (Settings → PIN & data).
+        payload = backup.export_backup(store)
+        name = f"braindump-backup-{date.today().isoformat()}.json"
+        return _download(json.dumps(payload, indent=1).encode(), name, "application/json")
+
+    @app.post("/api/import/backup", dependencies=[Depends(require_login)])
+    async def import_backup(file: UploadFile = File(...), key: str = Form("")):
+        raw = await file.read(MAX_BACKUP_BYTES + 1)
+        if len(raw) > MAX_BACKUP_BYTES:
+            raise HTTPException(413, "That backup is too large.")
+        try:
+            # No key given: assume the backup came from this app.
+            result = backup.import_backup(store, raw, key.strip() or settings.secret_key)
+        except backup.BackupError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        profile, result["profile"] = result.pop("profile"), False
+        current = config.get()["profile"]
+        if profile and not any(str(v).strip() for v in current.values()):
+            try:
+                fields = ProfileIn(**{k: str(v) for k, v in profile.items() if k in current}).model_dump()
+            except ValidationError:
+                fields = None
+            if fields:
+                config.update({"profile": fields})
+                result["profile"] = True
+        return result
+
+    @app.post("/api/settings/key", dependencies=[Depends(require_login)])
+    def show_key(body: KeyIn):
+        if not config.check_pin(body.pin.strip()):
+            raise HTTPException(400, "PIN is wrong.")
+        return {"key": settings.secret_key}
 
     # ---- static web app --------------------------------------------------
 

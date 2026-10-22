@@ -1,7 +1,7 @@
-# Reviewer
+# Brain Dump
 
 A private work journal that runs on your Mac. At the end of the day, talk (or type) for a few
-minutes about what you did. Reviewer transcribes it locally, turns it into easy-to-read
+minutes about what you did. Brain Dump transcribes it locally, turns it into easy-to-read
 highlights with an AI model, and stores it encrypted. Later, pick a date range and get a
 performance review, brag doc, status update or blog post, exportable as Word, Markdown, a web
 page or a CSV spreadsheet.
@@ -16,7 +16,7 @@ page or a CSV spreadsheet.
 **1. Install and open Ollama** from [ollama.com/download](https://ollama.com/download). It runs
 natively so it can use the Mac's GPU (Docker on a Mac can't), and listens on port 11434.
 
-**2. Start Reviewer:**
+**2. Start Brain Dump:**
 
 ```sh
 docker compose up -d --build
@@ -43,6 +43,25 @@ You can switch models in Settings at any time, and each entry has a "Redo summar
 compare. Ollama unloads the model after 15 minutes idle, so the first summary after a break
 takes a few extra seconds.
 
+## Mac app
+
+There is also a self-contained Mac app, **Brain Dump.app**, which runs the whole thing without
+Docker. It carries its own Python and starts the server when you open it, then stops it
+when you quit. You still need the Ollama app for summaries.
+
+```sh
+./macos/build.sh    # Apple Silicon, needs the Xcode command line tools
+```
+
+This builds `macos/dist/Brain Dump.app` and `macos/dist/Brain Dump.dmg`. Open the disk image
+and drag Brain Dump to Applications. In the setup screen the Ollama address is
+`http://localhost:11434`. The app keeps its data in `~/Library/Application Support/Brain Dump`
+(View → Show Data Folder), separate from the Docker volume. Its server log is in
+`~/Library/Logs/Brain Dump`.
+
+The app is signed only for the Mac that built it. Copied to another Mac, it needs
+right-click → Open the first time.
+
 ## Configuration
 
 Nothing is required in `.env`. See [`.env.example`](.env.example) for the optional settings.
@@ -59,7 +78,13 @@ serve`) and changing the port binding in `docker-compose.yml`.
 Everything lives in the `reviewer-data` Docker volume: `reviewer.db` (SQLite), the generated
 key if you didn't set `SECRET_KEY`, and the speech model cache.
 
-- **Settings → Download backup** gives you everything decrypted as JSON.
+- **Settings → PIN & data → Download backup** saves everything, still encrypted. It can only be
+  opened with this app's encryption key, which **Show key** on the same screen reveals after
+  you enter your PIN. Keep the key somewhere safe and separate from the backup.
+- **Load a backup** on the same screen adds the entries, end-of-day summaries and reports from a
+  backup, given the key of the app that made it (leave it empty for this app's own backups).
+  That's how you move from the server to the Mac app or back. Nothing already there is
+  replaced, loading the same backup twice adds nothing, and your PIN and AI settings stay as they are.
 - **History → Export CSV** gives a spreadsheet of every highlight.
 
 If you forget your PIN, stop the app and delete the volume to start over

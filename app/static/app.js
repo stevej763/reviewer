@@ -1086,6 +1086,53 @@ $("#change-pin").addEventListener("click", async (e) => {
   });
 });
 
+$("#show-key").addEventListener("click", async (e) => {
+  $("#key-error").textContent = "";
+  await busy(e.currentTarget, "Checking…", async () => {
+    try {
+      const { key } = await api("/api/settings/key", { method: "POST", body: { pin: $("#key-pin").value } });
+      $("#key-pin").value = "";
+      $("#key-value").value = key;
+      $("#key-box").hidden = false;
+    } catch (err) { $("#key-error").textContent = err.message; }
+  });
+});
+
+$("#copy-key").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("#key-value").value);
+    toast("Key copied");
+  } catch {
+    $("#key-value").select();
+    toast("Select the key and copy it");
+  }
+});
+
+$("#import-backup").addEventListener("click", async (e) => {
+  $("#import-error").textContent = "";
+  $("#import-result").textContent = "";
+  const file = $("#import-file").files[0];
+  if (!file) { $("#import-error").textContent = "Choose a backup file first."; return; }
+  const form = new FormData();
+  form.append("file", file);
+  form.append("key", $("#import-key").value);
+  await busy(e.currentTarget, "Loading…", async () => {
+    try {
+      const r = await api("/api/import/backup", { method: "POST", form });
+      const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+      let msg = `Added ${count(r.entries, "entry", "entries")}, ${count(r.days, "end-of-day summary", "end-of-day summaries")} `
+        + `and ${count(r.reports, "report", "reports")}.`;
+      if (!r.entries && !r.days && !r.reports) msg = "Nothing new: everything in this backup is already here.";
+      if (r.profile) msg += " Your \"About you\" details came across too.";
+      if (r.skipped) msg += ` Left out ${count(r.skipped, "recording", "recordings")} that hadn't been transcribed.`;
+      $("#import-result").textContent = msg;
+      $("#import-file").value = "";
+      $("#import-key").value = "";
+      toast("Backup loaded");
+    } catch (err) { $("#import-error").textContent = err.message; }
+  });
+});
+
 // ---------- start ----------
 
 $("#entry-date").value = today();

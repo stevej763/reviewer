@@ -317,7 +317,7 @@ def test_failed_transcription_can_be_retried(make_client):
 
 def test_security_headers_and_static(client):
     r = client.get("/")
-    assert r.status_code == 200 and "Reviewer" in r.text
+    assert r.status_code == 200 and "Brain Dump" in r.text
     assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
     assert client.get("/static/app.js").status_code == 200
 
@@ -568,3 +568,52 @@ def test_eta_while_running(make_client):
     w._end("transcribe", "small", 100)
     assert w.eta("entry", 7) is None
     assert round(w.timings.estimate("transcribe", "small", 100)) == 20
+
+
+def test_backup_stays_encrypted_and_moves_to_another_app(make_client, tmp_path, monkeypatch):
+    c, _ = make_client()
+    c.post("/api/login", json={"pin": PIN})
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "Shipped Apollo"})
+    c.post("/api/entries", json={"date": "2026-10-19", "text": "Mentored Sam"})
+    c.post("/api/days/2026-10-19/generate")
+    c.post("/api/reports", json={"start": "2026-10-01", "end": "2026-10-31"})
+
+    raw = c.get("/api/export/backup.json").content
+    assert b"Shipped Apollo" not in raw and b"Mentored" not in raw and b"sk-ant" not in raw
+    assert c.post("/api/settings/key", json={"pin": "999999"}).status_code == 400
+    key = c.post("/api/settings/key", json={"pin": PIN}).json()["key"]
+    assert key == "test-secret"
+
+    # Loading into this same app with no key adds nothing twice
+    r = c.post("/api/import/backup", files={"file": ("b.json", raw)}).json()
+    assert (r["entries"], r["days"], r["reports"]) == (0, 0, 0)
+
+    # A second app with its own key and an empty profile
+    other = tmp_path / "other"
+    monkeypatch.setenv("DATA_DIR", str(other))
+    monkeypatch.setenv("SECRET_KEY", "other-secret")
+    app2 = create_app(load_settings(), providers={"claude": FakeProvider()}, transcriber=FakeTranscriber(),
+                      background=False)
+    c2 = DrainingClient(app2)
+    c2.post("/api/setup", json={**SETUP, "profile": {}})
+    c2.post("/api/entries", json={"date": "2026-10-20", "text": "Already here"})
+
+    files = {"file": ("b.json", raw)}
+    assert c2.post("/api/import/backup", files=files).status_code == 400  # this app's key doesn't fit
+    assert c2.post("/api/import/backup", files=files, data={"key": "wrong"}).status_code == 400
+    bad = c2.post("/api/import/backup", files={"file": ("b.json", b"{}")}, data={"key": key})
+    assert bad.status_code == 400 and "isn't a Brain Dump backup" in bad.json()["detail"]
+
+    r = c2.post("/api/import/backup", files=files, data={"key": key}).json()
+    assert (r["entries"], r["days"], r["reports"], r["profile"]) == (2, 1, 1, True)
+    assert {e["text"] for e in c2.get("/api/entries").json()} == {"Shipped Apollo", "Mentored Sam", "Already here"}
+    day = c2.get("/api/days/2026-10-19").json()
+    assert day["summary"] and day["stale"] is False
+    assert c2.get("/api/reports").json()[0]["title"] == "My Review"
+    assert c2.get("/api/settings").json()["profile"]["name"] == "Steve"
+    assert app2.state.config.check_pin(PIN)  # PIN unchanged
+
+    # Stored under the new app's key, and importing again changes nothing
+    assert app2.state.store.raw_rows("entries")[-1]["raw_text"] not in raw
+    r = c2.post("/api/import/backup", files=files, data={"key": key}).json()
+    assert (r["entries"], r["days"], r["reports"]) == (0, 0, 0)
